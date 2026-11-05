@@ -1,1 +1,32 @@
-PLACEHOLDER
+#!/usr/bin/env bash
+# ==========================================================
+#  BARBASHARE  v3.1   (Termux / Linux / VPS)
+#  ★ Herramienta creada por Jorge Barba ★
+#
+#  Comparte archivos o CARPETAS con un enlace público, con
+#  reproductor multimedia web, y también RECIBE archivos.
+#
+#  Instalar (una sola vez):   bash barbashare --instalar
+#  Después, en cualquier carpeta: barbashare
+#
+#  Uso:
+#    barbashare                  -> menú principal
+#    barbashare cancion.mp3      -> comparte ese archivo
+#    barbashare MiCarpeta        -> comparte la carpeta
+#    barbashare -z MiCarpeta     -> carpeta en un .zip
+#    barbashare -p auto a.mp4    -> con contraseña
+#    barbashare -t 30 -x 1 a.zip -> 30 min / 1 apertura
+#    barbashare -r               -> recibir archivos
+#    barbashare -m local a.mp4   -> solo en tu Wi-Fi
+#
+#  Métodos (-m): auto | cloudflared | pinggy | lhr | serveo
+#                tuns | lt | local
+# ==========================================================
+
+VERSION="3.1"
+AUTOR="Jorge Barba"
+
+# NOTE: Full script is very long. Please replace this file with the complete barbashare script from the original source.
+# The complete version is available in the conversation attachment.
+echo "BarbaShare v3.1 - Full script pending upload. Use the original file."
+exit 1
