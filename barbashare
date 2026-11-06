@@ -1,0 +1,2616 @@
+#!/usr/bin/env bash
+# ==========================================================
+#  BARBASHARE  v3.1   (Termux / Linux / VPS)
+#  ★ Herramienta creada por Jorge Barba ★
+#
+#  Comparte archivos o CARPETAS con un enlace público, con
+#  reproductor multimedia web, y también RECIBE archivos.
+#
+#  Instalar (una sola vez):   bash barbashare --instalar
+#  Después, en cualquier carpeta: barbashare
+#
+#  Uso:
+#    barbashare                  -> menú principal
+#    barbashare cancion.mp3      -> comparte ese archivo
+#    barbashare MiCarpeta        -> comparte la carpeta
+#    barbashare -z MiCarpeta     -> carpeta en un .zip
+#    barbashare -p auto a.mp4    -> con contraseña
+#    barbashare -t 30 -x 1 a.zip -> 30 min / 1 apertura
+#    barbashare -r               -> recibir archivos
+#    barbashare -m local a.mp4   -> solo en tu Wi-Fi
+#
+#  Métodos (-m): auto | cloudflared | pinggy | lhr | serveo
+#                tuns | lt | local
+# ==========================================================
+
+VERSION="3.1"
+AUTOR="Jorge Barba"
+
+# ---------- Entorno ----------
+IS_TERMUX=false
+if [[ -n "${TERMUX_VERSION:-}" || -d /data/data/com.termux/files ]]; then
+    IS_TERMUX=true
+fi
+
+# ---------- Colores (solo si hay terminal) ----------
+if [[ -t 1 ]]; then
+    C_R=$'\e[1;31m'; C_G=$'\e[1;32m'; C_Y=$'\e[1;33m'; C_B=$'\e[1;34m'
+    C_C=$'\e[1;36m'; C_W=$'\e[1;37m'; C_D=$'\e[0;90m';  C_0=$'\e[0m'
+else
+    C_R=""; C_G=""; C_Y=""; C_B=""; C_C=""; C_W=""; C_D=""; C_0=""
+fi
+BAR="$(printf '═%.0s' {1..40})"
+
+bar()    { printf '%s%s%s\n' "$C_B" "$BAR" "$C_0"; }
+ok()     { printf '%s✔ %s%s\n' "$C_G" "$*" "$C_0"; }
+warn()   { printf '%s⚠ %s%s\n' "$C_Y" "$*" "$C_0"; }
+err()    { printf '%s✘ %s%s\n' "$C_R" "$*" "$C_0"; }
+info()   { printf '%s➜ %s%s\n' "$C_C" "$*" "$C_0"; }
+dim()    { printf '%s%s%s\n' "$C_D" "$*" "$C_0"; }
+titulo() { clear 2>/dev/null; bar; printf '%s %s%s\n' "$C_W" "$*" "$C_0"; bar; }
+banner() {
+    clear 2>/dev/null
+    bar
+    printf '%s  📡 BARBASHARE%s  %sv%s%s\n' "$C_W" "$C_0" "$C_D" "$VERSION" "$C_0"
+    printf '%s  ★ Creado por %s ★%s\n' "$C_C" "$AUTOR" "$C_0"
+    bar
+}
+opcion() { printf ' %s[%s]%s %s\n' "$C_G" "$1" "$C_0" "$2"; }
+
+# ---------- Estado global ----------
+PY=""
+PORT=""
+TMPD=""
+SERVER_PID=""
+TUNNEL_PID=""
+TLOG=""
+SLOG=""
+RE=""
+READY_RE=""
+NOMBRE=""
+URL_BASE=""
+METODO="auto"
+METODO_FIJO=false
+SEL=()
+NAMES=()
+FOLDER_MODE=""
+ZIP_FIXED=false
+PLAYER_OFF=false
+PLAYER=0
+QUIET=false
+PASSWORD=""
+EXPIRA_MIN=0
+MAX_ACCESOS=0
+RECV=false
+TUBE=false
+PROBAR=false
+ACTUALIZAR=false
+DEST_RECV=""
+MODO="share"
+BIND="127.0.0.1"
+CHOSEN=""
+HOLDING=false
+STOP=false
+WAKE=false
+
+SSH_OPTS=(-tt
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o LogLevel=ERROR
+    -o ServerAliveInterval=30
+    -o ServerAliveCountMax=3
+    -o ExitOnForwardFailure=yes
+    -o ConnectTimeout=20)
+
+# ==========================================================
+#  Limpieza y señales
+# ==========================================================
+detener_tunel() {
+    if [[ -n "$TUNNEL_PID" ]]; then
+        kill "$TUNNEL_PID" 2>/dev/null
+        wait "$TUNNEL_PID" 2>/dev/null
+        TUNNEL_PID=""
+    fi
+}
+
+parar_todo() {
+    detener_tunel
+    if [[ -n "$SERVER_PID" ]]; then
+        kill "$SERVER_PID" 2>/dev/null
+        wait "$SERVER_PID" 2>/dev/null
+        SERVER_PID=""
+    fi
+    exec 9>&- 2>/dev/null
+    if [[ -n "$TMPD" ]]; then
+        rm -rf -- "$TMPD" "$TMPD.http.log" "$TMPD.tunnel.log" "$TMPD.srv.py"
+        TMPD=""
+    fi
+}
+
+fin() {
+    parar_todo
+    if $WAKE; then termux-wake-unlock 2>/dev/null; WAKE=false; fi
+    printf '%s' "$C_0"
+}
+
+on_int() {
+    if $HOLDING; then
+        STOP=true
+    else
+        echo
+        exit 130
+    fi
+}
+
+trap on_int INT
+trap 'exit 143' TERM
+trap fin EXIT
+
+# ==========================================================
+#  Utilidades
+# ==========================================================
+short() {
+    local t='~'
+    echo "${1/#$HOME/$t}"
+}
+
+tamano() {
+    local s t
+    s=$(stat -c %s -- "$1" 2>/dev/null) || { echo "?"; return; }
+    if   (( s < 1024 ));       then echo "${s} B"
+    elif (( s < 1048576 ));    then echo "$(( s / 1024 )) KB"
+    elif (( s < 1073741824 )); then t=$(( s * 10 / 1048576 ));    echo "$(( t / 10 )).$(( t % 10 )) MB"
+    else                            t=$(( s * 10 / 1073741824 )); echo "$(( t / 10 )).$(( t % 10 )) GB"
+    fi
+}
+
+tamano_dir() {
+    local sz n
+    sz=$(du -sh -- "$1" 2>/dev/null | cut -f1)
+    n=$(find "$1" -type f 2>/dev/null | wc -l)
+    echo "${n} archivos, ${sz:-?}"
+}
+
+icono() {
+    case "${1,,}" in
+        *.mp3|*.wav|*.m4a|*.ogg|*.flac|*.aac|*.opus) echo "🎵" ;;
+        *.mp4|*.mkv|*.webm|*.mov|*.avi|*.3gp)        echo "🎬" ;;
+        *.jpg|*.jpeg|*.png|*.gif|*.webp|*.bmp)       echo "🖼" ;;
+        *.pdf)                                        echo "📕" ;;
+        *.apk)                                        echo "📦" ;;
+        *.zip|*.rar|*.7z|*.tar|*.gz|*.xz)            echo "🗜" ;;
+        *)                                            echo "📄" ;;
+    esac
+}
+
+recortar() {
+    local s="$1" max="${2:-34}"
+    if (( ${#s} > max )); then echo "${s:0:max-1}…"; else echo "$s"; fi
+}
+
+ip_local() {
+    "$PY" - <<'EOF'
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    s.connect(("10.255.255.255", 1))
+    print(s.getsockname()[0])
+except Exception:
+    print("")
+finally:
+    s.close()
+EOF
+}
+
+avisar() {   # mensaje
+    printf '\a'
+    if $IS_TERMUX && command -v termux-notification >/dev/null 2>&1; then
+        timeout 4 termux-notification --title "BarbaShare" --content "$1" >/dev/null 2>&1 &
+        command -v termux-vibrate >/dev/null 2>&1 && timeout 3 termux-vibrate -d 120 >/dev/null 2>&1 &
+    fi
+}
+
+aleatoria() {
+    LC_ALL=C tr -dc 'a-z0-9' </dev/urandom 2>/dev/null | head -c 6
+}
+
+urlenc() {
+    "$PY" -c 'import sys, urllib.parse as u; print(u.quote(sys.argv[1]))' "$1"
+}
+
+limpiar_log() {
+    tr -d '\r' < "$1" | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g'
+}
+
+instalar_pkg() {   # comando  paquete_termux  [paquete_apt]
+    local cmd="$1" pt="$2" pa="${3:-$2}" tmp
+    command -v "$cmd" >/dev/null 2>&1 && return 0
+    info "Instalando '$pt' (solo la primera vez)..."
+    tmp=$(mktemp "${TMPDIR:-/tmp}/inst.XXXXXX")
+    if $IS_TERMUX; then
+        pkg install -y "$pt" >"$tmp" 2>&1
+    elif command -v apt-get >/dev/null 2>&1; then
+        if [[ $EUID -eq 0 ]]; then
+            apt-get install -y "$pa" >"$tmp" 2>&1
+        elif command -v sudo >/dev/null 2>&1; then
+            sudo apt-get install -y "$pa" >"$tmp" 2>&1
+        fi
+    fi
+    if command -v "$cmd" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 0
+    fi
+    err "No se pudo instalar '$pt'."
+    [[ -s "$tmp" ]] && tail -n 4 "$tmp"
+    rm -f "$tmp"
+    if $IS_TERMUX; then
+        dim "Prueba a mano:  pkg update && pkg install $pt"
+    else
+        dim "Instálalo con tu gestor de paquetes (paquete: $pa)"
+    fi
+    return 1
+}
+
+detectar_python() {
+    local c
+    for c in python3 python; do
+        if command -v "$c" >/dev/null 2>&1; then PY="$c"; return 0; fi
+    done
+    return 1
+}
+
+puerto_libre() {
+    "$PY" - <<'EOF'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+EOF
+}
+
+# ==========================================================
+#  Preparación
+# ==========================================================
+preparar_entorno() {
+    if ! detectar_python; then
+        instalar_pkg python3 python python3 || return 1
+        detectar_python || { err "Python no disponible"; return 1; }
+    fi
+    # QR opcional: solo en Termux y una única vez
+    if $IS_TERMUX && ! command -v qrencode >/dev/null 2>&1 \
+        && [[ ! -e "$HOME/.compartir_qr_intentado" ]]; then
+        info "Instalando generador de QR (opcional, solo esta vez)..."
+        timeout 120 pkg install -y libqrencode >/dev/null 2>&1
+        : > "$HOME/.compartir_qr_intentado"
+    fi
+    if $IS_TERMUX && command -v termux-wake-lock >/dev/null 2>&1; then
+        termux-wake-lock 2>/dev/null && WAKE=true
+    fi
+    return 0
+}
+
+permiso_almacenamiento() {
+    warn "Termux aún no tiene acceso a tus archivos"
+    dim  "(Descargas, fotos, música...)"
+    local r
+    read -rp " ¿Dar acceso ahora? [S/n]: " r || exit 0
+    [[ "${r,,}" == n* ]] && return 1
+    info "Android te pedirá permiso: pulsa PERMITIR"
+    termux-setup-storage
+    local i
+    for ((i = 0; i < 30; i++)); do
+        [[ -d "$HOME/storage/shared" ]] && { ok "Acceso concedido"; sleep 1; return 0; }
+        sleep 1
+    done
+    warn "No se concedió el permiso. Solo verás archivos de Termux."
+    sleep 2
+    return 1
+}
+
+preparar_carpeta() {
+    local f base zipf
+    NAMES=()
+    TMPD=$(mktemp -d "${TMPDIR:-/tmp}/compartir.XXXXXX") || { err "No pude crear carpeta temporal"; return 1; }
+    for f in "${SEL[@]}"; do
+        base="$(basename -- "$f")"
+        if [[ -d "$f" && "$FOLDER_MODE" == "zip" ]]; then
+            zipf="$TMPD/$base.zip"
+            info "Comprimiendo '$base' (puede tardar)..."
+            if ! "$PY" -m zipfile -c "$zipf" "$f" >/dev/null 2>&1; then
+                err "No se pudo crear el .zip de '$base'"
+                return 1
+            fi
+            NAMES+=("$base.zip")
+        elif [[ -d "$f" ]]; then
+            ln -sfn -- "$f" "$TMPD/$base"
+            NAMES+=("$base/")
+        else
+            ln -sf -- "$f" "$TMPD/$base"
+            NAMES+=("$base")
+        fi
+    done
+    # entrada estándar "infinita" para ssh (evita que se cierre al instante)
+    local fifo="$TMPD.fifo"
+    mkfifo "$fifo" && exec 9<>"$fifo"
+    rm -f "$fifo"
+    SLOG="$TMPD.http.log"
+    TLOG="$TMPD.tunnel.log"
+    return 0
+}
+
+escribir_servidor() {
+    cat > "$TMPD.srv.py" <<'PYEOF'
+#!/usr/bin/env python3
+# Servidor local: archivos con soporte Range (adelantar/retroceder)
+# + reproductor multimedia web en "/" cuando PLAYER=1.
+import base64, functools, hmac, html, json, mimetypes, os, re, shutil, socket, subprocess, sys, threading, time, urllib.parse, uuid
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+
+PORT = int(sys.argv[1])
+ROOT = os.path.abspath(sys.argv[2])
+PLAYER = sys.argv[3] == "1"
+BIND = sys.argv[4] if len(sys.argv) > 4 else "127.0.0.1"
+MODE = sys.argv[5] if len(sys.argv) > 5 else "share"       # share | recv | tube
+DEST = os.path.abspath(sys.argv[6]) if len(sys.argv) > 6 else ROOT
+PASS = os.environ.get("COMPARTIR_PASS", "")
+CREDITO = '<footer class="cr">Hecho con ♥ usando <b>BarbaShare</b><br>Herramienta creada por <b>Jorge Barba</b></footer>'
+
+for ext, mt in (('.mp3', 'audio/mpeg'), ('.m4a', 'audio/mp4'), ('.flac', 'audio/flac'),
+                ('.opus', 'audio/ogg'), ('.aac', 'audio/aac'), ('.wav', 'audio/wav'),
+                ('.mkv', 'video/x-matroska'), ('.mp4', 'video/mp4'), ('.webm', 'video/webm'),
+                ('.mov', 'video/quicktime'), ('.3gp', 'video/3gpp'),
+                ('.lrc', 'text/plain'), ('.vtt', 'text/vtt'), ('.srt', 'text/plain')):
+    mimetypes.add_type(mt, ext)
+
+EXT_A = {'.mp3', '.wav', '.m4a', '.ogg', '.oga', '.flac', '.aac', '.opus', '.weba'}
+EXT_V = {'.mp4', '.webm', '.mkv', '.mov', '.m4v', '.3gp', '.ogv'}
+EXT_I = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'}
+EXT_L = ['.lrc', '.vtt', '.srt', '.txt']          # letras / subtítulos (por prioridad)
+COVER_NAMES = {'cover', 'folder', 'front', 'portada', 'album', 'artwork'}
+
+
+def natkey(s):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
+def quote(parts):
+    return '/' + '/'.join(urllib.parse.quote(x) for x in parts)
+
+
+def scan():
+    raw, seen = [], set()
+    for dp, dn, fn in os.walk(ROOT, followlinks=True):
+        rp = os.path.realpath(dp)
+        depth = dp[len(ROOT):].count(os.sep)
+        if rp in seen or depth > 8:
+            dn[:] = []
+            continue
+        seen.add(rp)
+        dn[:] = [d for d in dn if not d.startswith('.')]
+        for f in fn:
+            if f.startswith('.'):
+                continue
+            full = os.path.join(dp, f)
+            try:
+                size = os.path.getsize(full)
+            except OSError:
+                continue
+            rel = os.path.relpath(full, ROOT)
+            stem, ext = os.path.splitext(f)
+            ext = ext.lower()
+            raw.append({'dir': os.path.dirname(rel), 'f': f, 'stem': stem, 'ext': ext,
+                        'rel': rel, 'size': size})
+
+    media = {}                    # (dir, stem) -> item
+    items = []
+    for r in raw:
+        k = 'a' if r['ext'] in EXT_A else 'v' if r['ext'] in EXT_V else None
+        if k:
+            parts = r['rel'].split(os.sep)
+            it = {'k': k, 'n': r['stem'], 'b': r['f'], 'p': '/'.join(parts[:-1]),
+                  'u': quote(parts), 's': r['size'], '_r': r['rel']}
+            media[(r['dir'], r['stem'].lower())] = it
+            items.append(it)
+
+    audio_dirs = {}
+    for it in items:
+        if it['k'] == 'a':
+            audio_dirs.setdefault(os.path.dirname(it['_r']), []).append(it)
+
+    used = set()
+    for r in raw:
+        key = (r['dir'], r['stem'].lower())
+        # letras / subtítulos con el mismo nombre
+        if r['ext'] in EXT_L and key in media:
+            it = media[key]
+            cur = it.get('lx')
+            if cur is None or EXT_L.index(r['ext']) < EXT_L.index(cur):
+                it['lx'] = r['ext']
+                it['l'] = quote(r['rel'].split(os.sep))
+            used.add(r['rel'])
+        # portadas
+        if r['ext'] in EXT_I:
+            hit = False
+            if key in media and media[key]['k'] == 'a':
+                media[key]['c'] = quote(r['rel'].split(os.sep))
+                hit = True
+            elif r['stem'].lower() in COVER_NAMES and r['dir'] in audio_dirs:
+                for it in audio_dirs[r['dir']]:
+                    it.setdefault('c', quote(r['rel'].split(os.sep)))
+                hit = True
+            if hit:
+                used.add(r['rel'])
+
+    for r in raw:
+        if r['rel'] in used or r['ext'] in EXT_A or r['ext'] in EXT_V:
+            continue
+        parts = r['rel'].split(os.sep)
+        k = 'i' if r['ext'] in EXT_I else 'o'
+        items.append({'k': k, 'n': r['stem'] if k == 'i' else r['f'], 'b': r['f'],
+                      'p': '/'.join(parts[:-1]), 'u': quote(parts), 's': r['size'],
+                      '_r': r['rel']})
+
+    items.sort(key=lambda x: natkey(x['_r']))
+    for x in items:
+        del x['_r']
+    return items
+
+
+def title():
+    top = [e for e in os.listdir(ROOT) if not e.startswith('.')]
+    if len(top) == 1:
+        t = top[0]
+        return os.path.splitext(t)[0] if os.path.isfile(os.path.join(ROOT, t)) else t
+    return 'Archivos compartidos'
+
+
+PAGE = r'''<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<title>__TITLE__</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--fg:#eceff4;--mut:#8b93a3;--ac:#4f9cff;--bd:#2a303c;--g:#2b3a55}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6fa;--card:#fff;--fg:#1a1d24;--mut:#667085;--ac:#1f6feb;--bd:#dfe3ea;--g:#c9d8f5}}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+.wrap{max-width:720px;margin:0 auto;padding:14px}
+h1{font-size:1.05rem;margin:4px 0 12px;word-break:break-word;color:var(--mut);font-weight:600}
+h2{font-size:.85rem;color:var(--mut);margin:20px 0 8px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.stage{border:1px solid var(--bd);border-radius:18px;padding:16px;background:linear-gradient(180deg,var(--g),var(--card) 62%);transition:background .6s}
+.art{width:min(72vw,300px);aspect-ratio:1;margin:4px auto 14px;border-radius:16px;overflow:hidden;background:var(--bd);display:flex;align-items:center;justify-content:center;font-size:4rem;box-shadow:0 10px 30px rgba(0,0,0,.35)}
+.art img{width:100%;height:100%;object-fit:cover;display:block}
+#vwrap video,#vwrap img{width:100%;max-height:60vh;border-radius:12px;background:#000;display:block;object-fit:contain;margin-bottom:12px}
+.ttl{font-size:1.2rem;font-weight:700;text-align:center;word-break:break-word}
+.sub{color:var(--mut);text-align:center;font-size:.9rem;margin-top:2px;min-height:1.2em;word-break:break-word}
+.seek{display:flex;align-items:center;gap:8px;margin:14px 0 6px;font-size:.8rem;color:var(--mut);font-variant-numeric:tabular-nums}
+input[type=range]{flex:1;accent-color:var(--ac);height:28px;margin:0;min-width:0}
+.ctl,.ctl2{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:6px;flex-wrap:wrap}
+button,a.btn{background:transparent;color:var(--fg);border:0;border-radius:50%;min-width:44px;height:44px;padding:0 10px;font-size:1.15rem;text-decoration:none;cursor:pointer;display:inline-flex;align-items:center;justify-content:center}
+button:hover,a.btn:hover{background:rgba(127,127,127,.18)}
+button.on{color:var(--ac)}
+button.big{background:var(--ac);color:#fff;width:64px;height:64px;font-size:1.6rem}
+.pill{border-radius:20px;font-size:.85rem;font-weight:600;padding:0 14px;height:34px;background:var(--bd)}
+#vol{max-width:110px;flex:none}
+@media (max-width:520px){#vol{display:none}}
+.lyr{margin-top:14px;max-height:230px;overflow-y:auto;position:relative;text-align:center;padding:8px;border-radius:12px;background:rgba(0,0,0,.18);scroll-behavior:smooth}
+.lyr div{padding:4px 6px;color:var(--mut);transition:all .2s;cursor:pointer}
+.lyr div.on{color:var(--fg);font-weight:700;font-size:1.08rem}
+.lyr pre{white-space:pre-wrap;font:inherit;margin:0;color:var(--fg)}
+.srch{width:100%;padding:11px 14px;border-radius:12px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font-size:1rem;margin:14px 0 4px}
+ul{list-style:none;margin:0;padding:0}
+li{display:flex;align-items:center;gap:10px;background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px 12px;margin-bottom:6px}
+li.grp{background:none;border:0;padding:12px 4px 2px;color:var(--mut);font-size:.8rem}
+li.cur{border-color:var(--ac)}
+li.cur .n{color:var(--ac);font-weight:700}
+li .t{flex:1;min-width:0}
+li.m .t{cursor:pointer}
+li .n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+li .s{color:var(--mut);font-size:.8rem}
+li a{color:var(--ac);text-decoration:none;font-size:1.1rem;padding:6px}
+.cr{text-align:center;color:var(--mut);font-size:.78rem;margin:28px 0 6px;line-height:1.6}
+.cr b{color:var(--fg)}
+.by{display:inline-block;font-size:.72rem;color:var(--mut);border:1px solid var(--bd);border-radius:20px;padding:2px 11px;margin:-4px 0 12px}
+.by b{color:var(--fg)}
+input[type=range].sk{-webkit-appearance:none;appearance:none;background:transparent}
+.sk::-webkit-slider-runnable-track{height:5px;border-radius:5px;background:linear-gradient(to right,var(--ac) var(--p,0%),var(--bd) var(--p,0%))}
+.sk::-moz-range-track{height:5px;border-radius:5px;background:var(--bd)}
+.sk::-moz-range-progress{height:5px;border-radius:5px;background:var(--ac)}
+.sk::-webkit-slider-thumb{-webkit-appearance:none;width:15px;height:15px;border-radius:50%;background:var(--fg);margin-top:-5px}
+.sk::-moz-range-thumb{width:15px;height:15px;border:0;border-radius:50%;background:var(--fg)}
+.mini{position:fixed;left:8px;right:8px;bottom:calc(8px + env(safe-area-inset-bottom));max-width:704px;margin:0 auto;background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:6px 8px;display:flex;align-items:center;gap:6px;box-shadow:0 8px 24px rgba(0,0,0,.35);z-index:5}
+.mini .mt{flex:1;min-width:0;cursor:pointer;padding:0 4px}
+.mini .mt div.mn{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600;font-size:.92rem}
+.mini .ms{height:3px;background:var(--bd);border-radius:3px;margin-top:5px}
+.mini .ms i{display:block;height:100%;width:0;background:var(--ac);border-radius:3px}
+.lyr.full{position:fixed;inset:0;max-height:none;z-index:10;border-radius:0;background:var(--bg);padding:max(28px,env(safe-area-inset-top)) 20px 90px;font-size:1.45rem}
+.lyr.full div{padding:12px 8px}
+.lyr.full div.on{font-size:1.9rem;color:var(--ac)}
+.kbar{position:fixed;left:0;right:0;bottom:0;z-index:11;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:var(--bg);border-top:1px solid var(--bd);color:var(--mut);font-size:.85rem}
+.kbar b{color:var(--fg)}
+li.cur .n::before{content:'▶ ';color:var(--ac)}
+.wrap{padding-bottom:96px}
+[hidden]{display:none!important}
+</style></head><body><div class="wrap">
+<h1>🎧 __TITLE__</h1>
+<div class="by">by <b>Jorge Barba</b> · BarbaShare</div>
+<section class="stage" id="stage" hidden>
+  <div class="art" id="art"><img id="cover" alt="" hidden><span id="ph">🎵</span></div>
+  <div id="vwrap"></div>
+  <div class="ttl" id="ttl"></div>
+  <div class="sub" id="sub"></div>
+  <div class="seek" id="seekrow"><span id="tc">0:00</span><input type="range" class="sk" id="seek" min="0" max="1000" value="0" aria-label="Posición"><span id="td">0:00</span></div>
+  <div class="ctl">
+    <button id="shuf" title="Aleatorio (s)">🔀</button>
+    <button id="prev" title="Anterior (p)">⏮</button>
+    <button id="back" title="-10 s">⏪</button>
+    <button id="pp" class="big" title="Reproducir / pausa (espacio)">▶</button>
+    <button id="fwd" title="+10 s">⏩</button>
+    <button id="next" title="Siguiente (n)">⏭</button>
+    <button id="loop" title="Repetir (l)">🔁</button>
+  </div>
+  <div class="ctl2">
+    <button class="pill" id="spd" title="Velocidad">1×</button>
+    <input type="range" id="vol" min="0" max="100" value="100" aria-label="Volumen">
+    <button id="kar" title="Modo karaoke" hidden>🎤</button>
+    <button class="pill" id="slp" title="Temporizador de apagado">😴</button>
+    <button id="shr" title="Compartir esta página">📤</button>
+    <a class="btn" id="dl" title="Descargar">⬇</a>
+  </div>
+  <div class="lyr" id="lyr" hidden></div>
+</section>
+<div class="kbar" id="kbar" hidden><span>🎤 Karaoke · by <b>Jorge Barba</b></span><button id="kx" title="Cerrar">✕</button></div>
+<div class="mini" id="mini" hidden>
+  <button id="mpp">▶</button>
+  <div class="mt" id="mt"><div class="mn" id="mtt"></div><div class="ms"><i id="mp"></i></div></div>
+  <button id="mnx">⏭</button>
+</div>
+<input class="srch" id="q" type="search" placeholder="🔎 Buscar..." hidden>
+<h2 id="hm"></h2><ul id="list"></ul>
+<h2 id="ho"></h2><ul id="other"></ul>
+__CREDITO__
+</div>
+<script>
+const FILES=__DATA__;
+/* ---------- utilidades puras (ID3, letras, subtítulos) ---------- */
+function s4(b,o){return ((b[o]&127)<<21)|((b[o+1]&127)<<14)|((b[o+2]&127)<<7)|(b[o+3]&127);}
+function be4(b,o){return b[o]*16777216+(b[o+1]<<16)+(b[o+2]<<8)+b[o+3];}
+function dec(enc,b){
+  let e='windows-1252';
+  if(enc===1){
+    if(b[0]===0xFF&&b[1]===0xFE){e='utf-16le';b=b.subarray(2);}
+    else if(b[0]===0xFE&&b[1]===0xFF){e='utf-16be';b=b.subarray(2);}
+    else e='utf-16le';
+  }else if(enc===2)e='utf-16be';
+  else if(enc===3)e='utf-8';
+  try{return new TextDecoder(e).decode(b).replace(/\0+$/,'').replace(/\0/g,' / ');}catch(_){return '';}
+}
+function parseID3(b){
+  if(b.length<10||b[0]!==73||b[1]!==68||b[2]!==51)return null;
+  const ver=b[3]; if(ver<3||ver>4)return null;
+  const size=s4(b,6); let p=10; const end=Math.min(10+size,b.length);
+  if(b[5]&0x40){p+=ver===4?s4(b,p):be4(b,p)+4;}
+  const t={};
+  while(p+10<=end){
+    const id=String.fromCharCode(b[p],b[p+1],b[p+2],b[p+3]);
+    if(!/^[A-Z0-9]{4}$/.test(id))break;
+    const fs=ver===4?s4(b,p+4):be4(b,p+4);
+    const body=b.subarray(p+10,Math.min(p+10+fs,end));
+    p+=10+fs;
+    if(!body.length)continue;
+    if(id==='TIT2')t.title=dec(body[0],body.subarray(1));
+    else if(id==='TPE1')t.artist=dec(body[0],body.subarray(1));
+    else if(id==='TALB')t.album=dec(body[0],body.subarray(1));
+    else if(id==='APIC'&&!t.pic){
+      const enc=body[0]; let q=1;
+      while(q<body.length&&body[q]!==0)q++;
+      let mime=''; for(let i=1;i<q;i++)mime+=String.fromCharCode(body[i]);
+      q+=2;
+      if(enc===1||enc===2){while(q+1<body.length&&!(body[q]===0&&body[q+1]===0))q+=2;q+=2;}
+      else{while(q<body.length&&body[q]!==0)q++;q+=1;}
+      t.pic={mime:mime.indexOf('image/')===0?mime:'image/jpeg',data:body.subarray(q)};
+    }
+  }
+  return t;
+}
+function parseLRC(txt){
+  const out=[];
+  txt.split(/\r?\n/).forEach(l=>{
+    const tags=[...l.matchAll(/\[(\d+):(\d+(?:\.\d+)?)\]/g)];
+    if(!tags.length)return;
+    const s=l.replace(/\[[^\]]*\]/g,'').trim();
+    tags.forEach(m=>out.push({t:Number(m[1])*60+Number(m[2]),s:s}));
+  });
+  return out.sort((a,b)=>a.t-b.t);
+}
+function srt2vtt(t){return 'WEBVTT\n\n'+t.replace(/\r/g,'').replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g,'$1.$2');}
+function fmt(t){
+  if(!isFinite(t)||t<0)t=0; t=Math.floor(t);
+  const h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=t%60;
+  return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(s).padStart(2,'0');
+}
+function sz(n){const u=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];}
+/*DOM*/
+const $=id=>document.getElementById(id);
+const med=FILES.filter(f=>f.k!=='o'), oth=FILES.filter(f=>f.k==='o');
+const ICON={a:'🎵',v:'🎬',i:'🖼',o:'📄'};
+const SPEEDS=[1,1.25,1.5,2,0.75];
+const SL=[0,15,30,60];
+const BASE_TITLE=document.title;
+let slpI=0, slpT=null, stageOut=false;
+let pos=-1, shuf=false, loopMode=1, spd=0, tok=0, dragging=false, lrc=[], lrcOn=-1, hist=[];
+const A=new Audio(), V=document.createElement('video'), I=document.createElement('img');
+A.preload='auto'; V.preload='metadata'; V.controls=true; V.playsInline=true; I.alt='';
+V.hidden=true; I.hidden=true; $('vwrap').appendChild(V); $('vwrap').appendChild(I);
+let blobUrl=null;
+const cur=()=>med[pos]&&(med[pos].k==='a'?A:med[pos].k==='v'?V:null);
+
+function row(f,cls){
+  const li=document.createElement('li'); li.className=cls;
+  const t=document.createElement('div'); t.className='t';
+  const n=document.createElement('div'); n.className='n'; n.textContent=ICON[f.k]+' '+f.n;
+  const s=document.createElement('div'); s.className='s'; s.textContent=sz(f.s);
+  t.appendChild(n); t.appendChild(s);
+  const a=document.createElement('a'); a.href=f.u; a.setAttribute('download',f.b); a.textContent='⬇'; a.title='Descargar';
+  li.appendChild(t); li.appendChild(a);
+  li._txt=(f.n+' '+f.p).toLowerCase();
+  return li;
+}
+
+function setMode(k){
+  const aud=k==='a', vid=k==='v', img=k==='i';
+  $('art').hidden=!aud; V.hidden=!vid; I.hidden=!img; $('vwrap').hidden=aud;
+  $('seekrow').hidden=!aud; $('pp').hidden=!aud; $('back').hidden=!aud; $('fwd').hidden=!aud;
+  $('spd').hidden=img; $('vol').hidden=!aud; $('slp').hidden=img;
+  $('kar').hidden=true; $('kbar').hidden=true; $('lyr').classList.remove('full');
+}
+
+function setCover(url){
+  const c=$('cover');
+  if(!url){c.hidden=true;$('ph').hidden=false;$('stage').style.removeProperty('--g');return;}
+  c.onload=()=>{
+    c.hidden=false;$('ph').hidden=true;
+    try{
+      const cv=document.createElement('canvas');cv.width=cv.height=8;
+      const x=cv.getContext('2d');x.drawImage(c,0,0,8,8);
+      const d=x.getImageData(0,0,8,8).data;let r=0,g=0,b=0;
+      for(let i=0;i<d.length;i+=4){r+=d[i];g+=d[i+1];b+=d[i+2];}
+      const n=d.length/4;
+      $('stage').style.setProperty('--g','rgb('+Math.round(r/n*.55)+','+Math.round(g/n*.55)+','+Math.round(b/n*.55)+')');
+    }catch(_){}
+  };
+  c.onerror=()=>{c.hidden=true;$('ph').hidden=false;};
+  c.src=url;
+}
+
+async function readTags(u){
+  const lo={headers:{Range:'bytes=0-262143'},priority:'low'};
+  const r1=await fetch(u,lo);
+  let b=new Uint8Array(await r1.arrayBuffer());
+  if(b.length<10||b[0]!==73||b[1]!==68||b[2]!==51)return null;
+  const need=10+s4(b,6);
+  if(need>2097152)return parseID3(b);
+  if(need>b.length){
+    const r2=await fetch(u,{headers:{Range:'bytes='+b.length+'-'+(need-1)},priority:'low'});
+    const rest=new Uint8Array(await r2.arrayBuffer());
+    const all=new Uint8Array(b.length+rest.length); all.set(b,0); all.set(rest,b.length); b=all;
+  }
+  return parseID3(b);
+}
+
+function mediaSession(f,art){
+  if(!('mediaSession' in navigator))return;
+  try{
+    navigator.mediaSession.metadata=new MediaMetadata({title:$('ttl').textContent,artist:$('sub').textContent,
+      album:'BarbaShare · by Jorge Barba',artwork:art?[{src:art,sizes:'512x512'}]:[]});
+    const h=(a,fn)=>{try{navigator.mediaSession.setActionHandler(a,fn);}catch(_){}};
+    h('previoustrack',prev); h('nexttrack',next);
+    h('play',()=>A.play()); h('pause',()=>A.pause());
+    h('seekbackward',()=>{A.currentTime=Math.max(0,A.currentTime-10);});
+    h('seekforward',()=>{A.currentTime+=10;});
+    h('seekto',e=>{A.currentTime=e.seekTime;});
+  }catch(_){}
+}
+
+async function loadMeta(f,my){
+  let art=f.c||null;
+  try{
+    const t=await readTags(f.u);
+    if(my!==tok)return;
+    if(t){
+      if(t.title)$('ttl').textContent=t.title;
+      const sub=[t.artist,t.album].filter(Boolean).join(' · ');
+      if(sub)$('sub').textContent=sub;
+      if(t.pic&&t.pic.data.length){
+        if(blobUrl)URL.revokeObjectURL(blobUrl);
+        blobUrl=URL.createObjectURL(new Blob([t.pic.data],{type:t.pic.mime}));
+        art=blobUrl;
+      }
+    }
+  }catch(_){}
+  if(my!==tok)return;
+  setCover(art);
+  mediaSession(f,art);
+}
+
+function renderLyrics(txt,ext){
+  const box=$('lyr'); box.innerHTML=''; lrc=[]; lrcOn=-1;
+  if(ext==='.lrc'||/\[\d+:\d+(\.\d+)?\]/.test(txt)){
+    lrc=parseLRC(txt);
+    if(lrc.length){
+      lrc.forEach((l,i)=>{const d=document.createElement('div');d.textContent=l.s||'♪';d.onclick=()=>{A.currentTime=l.t;};box.appendChild(d);});
+      box.hidden=false; $('kar').hidden=false; return;
+    }
+  }
+  const pre=document.createElement('pre'); pre.textContent=txt.trim();
+  box.appendChild(pre); box.hidden=!txt.trim();
+}
+function syncLyrics(){
+  if(!lrc.length)return;
+  const t=A.currentTime+0.25; let i=-1;
+  for(let k=0;k<lrc.length;k++){if(lrc[k].t<=t)i=k;else break;}
+  if(i===lrcOn)return;
+  const box=$('lyr'), kids=box.children;
+  if(lrcOn>=0&&kids[lrcOn])kids[lrcOn].classList.remove('on');
+  lrcOn=i;
+  if(i>=0&&kids[i]){kids[i].classList.add('on');box.scrollTo({top:kids[i].offsetTop-box.clientHeight/2+kids[i].clientHeight/2});}
+}
+
+function stopAll(){
+  A.pause(); V.pause(); V.removeAttribute('src'); I.removeAttribute('src');
+  while(V.firstChild)V.removeChild(V.firstChild);
+  $('lyr').hidden=true; $('lyr').innerHTML=''; lrc=[]; lrcOn=-1; $('kar').hidden=true; $('kbar').hidden=true; $('lyr').classList.remove('full');
+}
+
+function play(i,auto,scroll){
+  if(i<0||i>=med.length)return;
+  const my=++tok; pos=i; const f=med[i];
+  stopAll(); setMode(f.k);
+  $('ttl').textContent=f.n; $('sub').textContent=f.p||''; $('dl').href=f.u; $('dl').setAttribute('download',f.b);
+  $('stage').hidden=false;
+  document.querySelectorAll('#list li.m').forEach(li=>li.classList.toggle('cur',Number(li.dataset.i)===i));
+  const rate=SPEEDS[spd];
+  if(f.k==='a'){
+    setCover(f.c||null);
+    A.src=f.u; A.defaultPlaybackRate=rate; A.playbackRate=rate;
+    if(auto){const p=A.play(); if(p&&p.catch)p.catch(()=>{});}
+    setTimeout(()=>{
+      if(my!==tok)return;
+      loadMeta(f,my);
+      if(f.l){
+        fetch(f.l).then(r=>r.text()).then(t=>{if(my===tok)renderLyrics(t,f.lx);}).catch(()=>{});
+      }
+    },auto?900:350);
+  }else if(f.k==='v'){
+    V.src=f.u; V.defaultPlaybackRate=rate; V.playbackRate=rate;
+    if(f.l&&(f.lx==='.vtt'||f.lx==='.srt')){
+      fetch(f.l).then(r=>r.text()).then(t=>{
+        if(my!==tok)return;
+        const tr=document.createElement('track'); tr.kind='subtitles'; tr.label='Subtítulos'; tr.srclang='es'; tr.default=true;
+        tr.src=URL.createObjectURL(new Blob([f.lx==='.srt'?srt2vtt(t):t],{type:'text/vtt'}));
+        V.appendChild(tr);
+      }).catch(()=>{});
+    }
+    if(auto){const p=V.play(); if(p&&p.catch)p.catch(()=>{});}
+    mediaSession(f,null);
+  }else{
+    I.src=f.u;
+    const nx=med[(i+1)%med.length]; if(nx&&nx.k==='i'){const pre=new Image(); pre.src=nx.u;}
+  }
+  upd();
+  if(scroll)$('stage').scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+function nxt(){
+  if(loopMode===2)return pos;
+  if(shuf&&med.length>1){let j;do{j=Math.floor(Math.random()*med.length);}while(j===pos);return j;}
+  const j=pos+1; return j>=med.length?(loopMode===1?0:-1):j;
+}
+function next(){const j=nxt(); if(j>=0){hist.push(pos);play(j,true);}}
+function prev(){
+  const c=cur();
+  if(c&&c.currentTime>3){c.currentTime=0;return;}
+  if(shuf&&hist.length){play(hist.pop(),true);return;}
+  play(pos>0?pos-1:(loopMode===1?med.length-1:0),true);
+}
+function ended(){ if(med[pos]&&med[pos].k!=='i')next(); }
+A.addEventListener('ended',ended); V.addEventListener('ended',ended);
+function upd(){
+  $('pp').textContent=A.paused?'▶':'⏸';
+  $('shuf').classList.toggle('on',shuf);
+  $('loop').classList.toggle('on',loopMode>0);
+  $('loop').textContent=loopMode===2?'🔂':'🔁';
+  $('spd').textContent=(SPEEDS[spd]+'×').replace('0.75','¾');
+  $('slp').textContent=SL[slpI]?('😴 '+SL[slpI]+'m'):'😴';
+  $('mpp').textContent=A.paused?'▶':'⏸';
+  document.title=(!A.paused&&med[pos]?'▶ '+$('ttl').textContent+' · ':'')+BASE_TITLE;
+  miniUpd();
+}
+function miniUpd(){
+  const show=stageOut&&pos>=0&&med[pos]&&med[pos].k==='a';
+  $('mini').hidden=!show;
+  if(show)$('mtt').textContent=$('ttl').textContent;
+}
+A.addEventListener('play',upd); A.addEventListener('pause',upd);
+A.addEventListener('loadedmetadata',()=>{$('td').textContent=fmt(A.duration);});
+A.addEventListener('timeupdate',()=>{
+  if(!dragging&&isFinite(A.duration)&&A.duration>0){
+    $('seek').value=Math.round(A.currentTime/A.duration*1000);
+    const pc=(A.currentTime/A.duration*100).toFixed(1)+'%';
+    $('seek').style.setProperty('--p',pc); $('mp').style.width=pc;
+    $('tc').textContent=fmt(A.currentTime); $('td').textContent=fmt(A.duration);
+  }
+  syncLyrics();
+  try{if('mediaSession' in navigator&&isFinite(A.duration))navigator.mediaSession.setPositionState({duration:A.duration,position:A.currentTime,playbackRate:A.playbackRate});}catch(_){}
+});
+$('seek').addEventListener('input',()=>{dragging=true;$('seek').style.setProperty('--p',($('seek').value/10)+'%');if(isFinite(A.duration))$('tc').textContent=fmt($('seek').value/1000*A.duration);});
+$('seek').addEventListener('change',()=>{if(isFinite(A.duration))A.currentTime=$('seek').value/1000*A.duration;dragging=false;});
+$('pp').onclick=()=>{A.paused?A.play().catch(()=>{}):A.pause();};
+$('back').onclick=()=>{A.currentTime=Math.max(0,A.currentTime-10);};
+$('fwd').onclick=()=>{A.currentTime=Math.min(A.duration||1e9,A.currentTime+10);};
+$('prev').onclick=prev; $('next').onclick=next;
+$('shuf').onclick=()=>{shuf=!shuf;hist=[];upd();};
+$('loop').onclick=()=>{loopMode=(loopMode+1)%3;upd();};
+$('spd').onclick=()=>{spd=(spd+1)%SPEEDS.length;const r=SPEEDS[spd];A.defaultPlaybackRate=A.playbackRate=r;V.defaultPlaybackRate=V.playbackRate=r;upd();};
+$('vol').oninput=()=>{A.volume=V.volume=$('vol').value/100;};
+$('slp').onclick=()=>{
+  slpI=(slpI+1)%SL.length; clearTimeout(slpT); slpT=null;
+  if(SL[slpI])slpT=setTimeout(()=>{A.pause();V.pause();slpI=0;upd();},SL[slpI]*60000);
+  upd();
+};
+$('shr').onclick=()=>{
+  const url=location.href, ok=()=>{$('shr').textContent='✔';setTimeout(()=>{$('shr').textContent='📤';},1500);};
+  if(navigator.share){navigator.share({title:BASE_TITLE,url:url}).catch(()=>{});}
+  else if(navigator.clipboard){navigator.clipboard.writeText(url).then(ok).catch(()=>{});}
+};
+function karaoke(on){
+  $('lyr').classList.toggle('full',on); $('kbar').hidden=!on;
+  document.body.style.overflow=on?'hidden':'';
+  if(on){lrcOn=-1;syncLyrics();}
+}
+$('kar').onclick=()=>karaoke(true); $('kx').onclick=()=>karaoke(false);
+$('mpp').onclick=$('pp').onclick; $('mnx').onclick=next;
+$('mt').onclick=()=>$('stage').scrollIntoView({behavior:'smooth',block:'start'});
+if('IntersectionObserver' in window){
+  new IntersectionObserver(es=>{stageOut=!es[0].isIntersecting;miniUpd();}).observe($('stage'));
+}
+
+/* ---------- listas ---------- */
+let lastP=null;
+med.forEach((f,i)=>{
+  if(f.p!==lastP&&(f.p||lastP!==null)){const g=document.createElement('li');g.className='grp';g.textContent='📁 '+(f.p||'/');$('list').appendChild(g);}
+  lastP=f.p;
+  const li=row(f,'m'); li.dataset.i=i;
+  li.querySelector('.t').onclick=()=>play(i,true,true);
+  $('list').appendChild(li);
+});
+oth.forEach(f=>$('other').appendChild(row(f,'o')));
+$('hm').textContent=med.length?('Reproductor · '+med.length):''; if(!med.length)$('list').remove();
+$('ho').textContent=oth.length?((med.length?'Otros archivos':'Archivos')+' · '+oth.length):''; if(!oth.length)$('other').remove();
+if(med.length+oth.length>8){
+  $('q').hidden=false;
+  $('q').oninput=()=>{
+    const q=$('q').value.trim().toLowerCase();
+    document.querySelectorAll('#list li,#other li').forEach(li=>{
+      if(li.classList.contains('grp'))li.hidden=!!q; else li.hidden=!!q&&li._txt.indexOf(q)<0;
+    });
+  };
+}
+
+/* ---------- teclado y gestos ---------- */
+document.addEventListener('keydown',e=>{
+  if(/INPUT|TEXTAREA/.test((e.target.tagName||''))&&e.target.type!=='range')return;
+  if(e.ctrlKey||e.metaKey||e.altKey||pos<0)return;
+  const c=cur(), k=e.key;
+  if(k===' '&&c){e.preventDefault();c.paused?c.play().catch(()=>{}):c.pause();}
+  else if(k==='ArrowRight'){e.preventDefault();if(c)c.currentTime+=e.shiftKey?10:5;else next();}
+  else if(k==='ArrowLeft'){e.preventDefault();if(c)c.currentTime-=e.shiftKey?10:5;else prev();}
+  else if(k==='n')next(); else if(k==='p')prev();
+  else if(k==='s'){shuf=!shuf;hist=[];upd();}
+  else if(k==='l'){loopMode=(loopMode+1)%3;upd();}
+  else if(k==='m'&&c){c.muted=!c.muted;}
+  else if(k==='Escape'){karaoke(false);}
+  else if(k==='k'&&!$('kar').hidden){karaoke($('kbar').hidden);}
+});
+let tx=null;
+$('stage').addEventListener('touchstart',e=>{if(e.target.closest('input,button,a,video,.lyr'))return;tx=e.touches[0].clientX;},{passive:true});
+$('stage').addEventListener('touchend',e=>{
+  if(tx===null)return; const dx=e.changedTouches[0].clientX-tx; tx=null;
+  if(Math.abs(dx)>60){dx<0?next():prev();}
+},{passive:true});
+
+if(med.length){play(0,false,false);}
+</script></body></html>'''
+
+
+_cache = {'t': 0, 'data': None}
+
+
+def page():
+    if _cache['data'] is None or time.time() - _cache['t'] > 15:
+        _cache['data'] = json.dumps(scan(), ensure_ascii=False).replace('</', '<\\/')
+        _cache['t'] = time.time()
+    data = _cache['data']
+    t = html.escape(title())
+    return PAGE.replace('__TITLE__', t).replace('__CREDITO__', CREDITO).replace('__DATA__', data)
+
+
+UPLOAD = r'''<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Enviar archivos</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--fg:#eceff4;--mut:#8b93a3;--ac:#4f9cff;--bd:#2a303c;--ok:#3ecf8e;--er:#ff6b6b}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6fa;--card:#fff;--fg:#1a1d24;--mut:#667085;--ac:#1f6feb;--bd:#dfe3ea;--ok:#12a36a;--er:#d92d20}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+.wrap{max-width:560px;margin:0 auto;padding:18px}
+h1{font-size:1.3rem;margin:8px 0 4px}
+p{color:var(--mut);margin:0 0 16px}
+.drop{display:block;border:2px dashed var(--bd);border-radius:18px;padding:34px 16px;text-align:center;background:var(--card);cursor:pointer;transition:.2s}
+.drop.over{border-color:var(--ac);background:rgba(79,156,255,.1)}
+.drop b{display:block;font-size:1.1rem;margin-bottom:4px}
+.drop span{color:var(--mut);font-size:.9rem}
+input[type=file]{display:none}
+ul{list-style:none;margin:16px 0;padding:0}
+li{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px 12px;margin-bottom:8px}
+li .n{word-break:break-all}
+li .s{display:flex;justify-content:space-between;font-size:.8rem;color:var(--mut);margin-top:4px}
+progress{width:100%;height:8px;margin-top:6px;accent-color:var(--ac)}
+li.ok .st{color:var(--ok)} li.er .st{color:var(--er)}
+.cr{text-align:center;color:var(--mut);font-size:.78rem;margin:26px 0 8px}
+.cr b{color:var(--fg)}
+</style></head><body><div class="wrap">
+<h1>📥 Enviar archivos</h1>
+<p>Elige o arrastra los archivos que quieres mandar.</p>
+<label class="drop" id="drop"><input type="file" id="f" multiple><b>Toca para elegir archivos</b><span>o suéltalos aquí</span></label>
+<ul id="list"></ul>
+__CREDITO__
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const q=[]; let busy=false;
+function sz(n){const u=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];}
+function add(files){
+  for(const f of files){
+    const li=document.createElement('li');
+    li.innerHTML='<div class="n"></div><progress max="100" value="0"></progress><div class="s"><span class="st">En cola</span><span></span></div>';
+    li.querySelector('.n').textContent=f.name;
+    li.querySelector('.s span:last-child').textContent=sz(f.size);
+    $('list').appendChild(li); q.push({f,li});
+  }
+  next();
+}
+function next(){
+  if(busy||!q.length)return; busy=true;
+  const {f,li}=q.shift(), st=li.querySelector('.st'), pr=li.querySelector('progress');
+  const x=new XMLHttpRequest();
+  x.open('PUT','/upload?name='+encodeURIComponent(f.name));
+  x.setRequestHeader('Content-Type','application/octet-stream');
+  x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded/e.total*100);pr.value=p;st.textContent='Enviando '+p+'%';}};
+  const fin=(ok,msg)=>{li.classList.add(ok?'ok':'er');st.textContent=msg;if(ok)pr.value=100;busy=false;next();};
+  x.onload=()=>{x.status===200?fin(true,'✔ Enviado'):fin(false,'✘ Error ('+x.status+')');};
+  x.onerror=()=>fin(false,'✘ Falló la conexión');
+  x.send(f);
+}
+$('f').onchange=e=>{add(e.target.files);e.target.value='';};
+const d=$('drop');
+['dragenter','dragover'].forEach(t=>d.addEventListener(t,e=>{e.preventDefault();d.classList.add('over');}));
+['dragleave','drop'].forEach(t=>d.addEventListener(t,e=>{e.preventDefault();d.classList.remove('over');}));
+d.addEventListener('drop',e=>add(e.dataTransfer.files));
+</script></body></html>'''
+
+
+def safe_name(n):
+    n = os.path.basename(n.replace('\\', '/'))
+    n = re.sub(r'[\x00-\x1f<>:"|?*]', '_', n).strip().lstrip('.')
+    return n[:150] or 'archivo'
+
+
+def unique(p):
+    if not os.path.exists(p):
+        return p
+    b, e = os.path.splitext(p)
+    i = 1
+    while os.path.exists('%s (%d)%s' % (b, i, e)):
+        i += 1
+    return '%s (%d)%s' % (b, i, e)
+
+
+# ----------------------------------------------------------
+#  Modo YouTube: buscar y descargar (usa yt-dlp)
+# ----------------------------------------------------------
+YT = shutil.which('yt-dlp')
+FFMPEG = shutil.which('ffmpeg')
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOBS_SEM = threading.Semaphore(2)
+ID_RE = re.compile(r'^[A-Za-z0-9_-]{11}$')
+URL_RE = re.compile(r'(?:youtube\.com/(?:watch\?(?:[^#]*&)?v=|shorts/|embed/|live/)|youtu\.be/)([A-Za-z0-9_-]{11})')
+LIB_EXT = {'.mp3', '.m4a', '.opus', '.ogg', '.webm', '.mp4', '.mkv'}
+
+
+def extract_id(text):
+    text = (text or '').strip()
+    if ID_RE.match(text):
+        return text
+    m = URL_RE.search(text)
+    return m.group(1) if m else None
+
+
+def card(vid, e):
+    return {'id': vid, 'title': e.get('title') or vid,
+            'ch': e.get('channel') or e.get('uploader') or '',
+            'dur': e.get('duration'),
+            'th': 'https://i.ytimg.com/vi/%s/mqdefault.jpg' % vid}
+
+
+def yt_search(q):
+    q = ' '.join((q or '').split())[:100]
+    if not q:
+        return []
+    p = subprocess.run([YT, '--flat-playlist', '-J', '--no-warnings', '--socket-timeout', '15',
+                        'ytsearch12:' + q], capture_output=True, text=True, timeout=75)
+    data = json.loads(p.stdout or '{}')
+    out = []
+    for e in data.get('entries') or []:
+        vid = e.get('id')
+        if vid and ID_RE.match(vid):
+            out.append(card(vid, e))
+    return out
+
+
+def yt_info(vid):
+    p = subprocess.run([YT, '-J', '--no-playlist', '--no-warnings', '--socket-timeout', '15',
+                        'https://www.youtube.com/watch?v=' + vid],
+                       capture_output=True, text=True, timeout=75)
+    return card(vid, json.loads(p.stdout or '{}'))
+
+
+def run_job(jid, vid, fmt):
+    j = JOBS[jid]
+    with JOBS_SEM:
+        j['status'] = 'running'
+        os.makedirs(DEST, exist_ok=True)
+        cmd = [YT, '--no-playlist', '--newline', '--progress', '--no-warnings', '--windows-filenames',
+               '--match-filter', 'duration<=7200',
+               '-o', os.path.join(DEST, '%(title).120B [%(id)s].%(ext)s'),
+               '--print', 'after_move:filepath']
+        if fmt == 'mp3':
+            if FFMPEG:
+                cmd += ['-x', '--audio-format', 'mp3', '--audio-quality', '0']
+            else:
+                cmd += ['-f', 'bestaudio[ext=m4a]/bestaudio']
+        else:
+            if FFMPEG:
+                cmd += ['-f', 'bv*[height<=720][ext=mp4]+ba[ext=m4a]/b[height<=720][ext=mp4]/b[ext=mp4]/b',
+                        '--merge-output-format', 'mp4']
+            else:
+                cmd += ['-f', 'b[ext=mp4]/b']
+        cmd.append('https://www.youtube.com/watch?v=' + vid)
+        last = ''
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, bufsize=1, errors='replace')
+            timer = threading.Timer(1800, proc.kill)
+            timer.start()
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.search(r'\[download\]\s+([\d.]+)%', line)
+                if m:
+                    j['pct'] = float(m.group(1))
+                elif line.startswith('[ExtractAudio]') or line.startswith('[Merger]') or 'Post-process' in line:
+                    j['msg'] = 'Convirtiendo...'
+                    j['pct'] = 100.0
+                elif os.path.isabs(line) and os.path.isfile(line):
+                    j['file'] = os.path.basename(line)
+                elif line.startswith('ERROR'):
+                    last = line[:200]
+            proc.wait()
+            timer.cancel()
+        except Exception as ex:
+            last = str(ex)[:200]
+            proc = None
+        if j.get('file') and proc is not None and proc.returncode == 0:
+            j['status'] = 'done'
+            j['pct'] = 100.0
+            sys.stderr.write('DESCARGADO %s\n' % j['file'])
+            sys.stderr.flush()
+        else:
+            j['status'] = 'error'
+            j['msg'] = last or 'No se pudo descargar (¿privado, de más de 2 h o sin conexión?)'
+
+
+def list_library():
+    out = []
+    try:
+        for n in os.listdir(DEST):
+            fp = os.path.join(DEST, n)
+            if n.startswith('.') or not os.path.isfile(fp):
+                continue
+            if os.path.splitext(n)[1].lower() in LIB_EXT:
+                st = os.stat(fp)
+                out.append({'n': n, 's': st.st_size, 't': st.st_mtime})
+    except OSError:
+        pass
+    out.sort(key=lambda x: -x['t'])
+    return out[:200]
+
+
+AVISO = ('Usa esta herramienta solo con contenido tuyo, de dominio público, Creative Commons '
+         'o con permiso del autor. Descargar material protegido puede infringir los Términos '
+         'de YouTube y los derechos de autor.')
+
+TUBE = r'''<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>YouTube · BarbaShare</title>
+<style>
+:root{--bg:#0f1115;--card:#181b22;--fg:#eceff4;--mut:#8b93a3;--ac:#ff4e45;--bd:#2a303c;--ok:#3ecf8e}
+@media (prefers-color-scheme:light){:root{--bg:#f4f6fa;--card:#fff;--fg:#1a1d24;--mut:#667085;--ac:#e0352d;--bd:#dfe3ea;--ok:#12a36a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+.wrap{max-width:720px;margin:0 auto;padding:14px}
+h1{font-size:1.15rem;margin:4px 0 8px}
+.by{display:inline-block;font-size:.72rem;color:var(--mut);border:1px solid var(--bd);border-radius:20px;padding:2px 11px;margin:0 0 12px}
+.by b{color:var(--fg)}
+.aviso{font-size:.78rem;color:var(--mut);background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:8px 12px;margin-bottom:12px}
+form{display:flex;gap:8px}
+input[type=search]{flex:1;min-width:0;padding:12px 14px;border-radius:12px;border:1px solid var(--bd);background:var(--card);color:var(--fg);font-size:1rem}
+button{background:var(--ac);color:#fff;border:0;border-radius:12px;padding:0 16px;font-size:1rem;cursor:pointer;min-height:44px}
+button.sec{background:var(--bd);color:var(--fg);padding:0 12px;min-height:38px;font-size:.9rem}
+h2{font-size:.85rem;color:var(--mut);margin:20px 0 8px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.r{display:flex;gap:10px;background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:8px;margin-bottom:8px}
+.r img{width:120px;height:68px;object-fit:cover;border-radius:8px;background:#000;flex:none}
+.r .i{flex:1;min-width:0}
+.r .t{font-weight:600;font-size:.92rem;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-word}
+.r .c{color:var(--mut);font-size:.78rem;margin:2px 0 6px}
+.r .b{display:flex;gap:6px;flex-wrap:wrap}
+.job{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px 12px;margin-bottom:8px}
+.job .n{word-break:break-word;font-size:.9rem}
+progress{width:100%;height:8px;margin-top:6px;accent-color:var(--ac)}
+.job .s{font-size:.8rem;color:var(--mut);margin-top:4px}
+.job.ok .s{color:var(--ok)} .job.er .s{color:#ff6b6b}
+.job a{color:var(--ac);font-weight:600;text-decoration:none}
+audio,video{width:100%;margin-top:8px;border-radius:10px}
+.lib{display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:8px 12px;margin-bottom:6px}
+.lib .t{flex:1;min-width:0;word-break:break-word;font-size:.9rem;cursor:pointer}
+.lib a{color:var(--ac);text-decoration:none;font-size:1.1rem;padding:4px 6px}
+.msg{color:var(--mut);padding:10px 2px}
+.cr{text-align:center;color:var(--mut);font-size:.78rem;margin:28px 0 6px;line-height:1.6}
+.cr b{color:var(--fg)}
+[hidden]{display:none!important}
+</style></head><body><div class="wrap">
+<h1>🎬 YouTube · buscar y descargar</h1>
+<div class="by">by <b>Jorge Barba</b> · BarbaShare</div>
+<div class="aviso">⚠ __AVISO__</div>
+<form id="f"><input id="q" type="search" placeholder="Busca o pega un enlace de YouTube" autocomplete="off"><button>🔎</button></form>
+<div id="res"></div>
+<h2 id="hj" hidden>Descargas</h2><div id="jobs"></div>
+<h2>Mi biblioteca</h2><div id="lib"></div>
+__CREDITO__
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const HD={'X-BS':'1'};
+async function api(u,opt){
+  const r=await fetch(u,Object.assign({headers:HD},opt||{}));
+  let d={}; try{d=await r.json();}catch(_){}
+  if(!r.ok&&!d.error)d.error='Error '+r.status;
+  return d;
+}
+function fmt(t){if(!t)return '';t=Math.floor(t);const h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=t%60;return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(s).padStart(2,'0');}
+function sz(n){const u=['B','KB','MB','GB'];let i=0;while(n>=1024&&i<3){n/=1024;i++;}return (i?n.toFixed(1):n)+' '+u[i];}
+function isUrl(s){return /(youtu\.be\/|youtube\.com\/)/i.test(s)||/^[A-Za-z0-9_-]{11}$/.test(s);}
+function msg(t){$('res').innerHTML='';const d=document.createElement('div');d.className='msg';d.textContent=t;$('res').appendChild(d);}
+$('f').onsubmit=async e=>{
+  e.preventDefault();
+  const q=$('q').value.trim(); if(!q)return;
+  msg('Buscando...');
+  const d=isUrl(q)?await api('/api/info?q='+encodeURIComponent(q)):await api('/api/search?q='+encodeURIComponent(q));
+  if(d.error){msg('✘ '+d.error);return;}
+  const list=d.results||[]; if(!list.length){msg('Sin resultados.');return;}
+  $('res').innerHTML=''; list.forEach(show);
+};
+function show(v){
+  const r=document.createElement('div'); r.className='r';
+  const im=document.createElement('img'); im.src=v.th; im.loading='lazy'; im.referrerPolicy='no-referrer'; im.alt='';
+  const i=document.createElement('div'); i.className='i';
+  const t=document.createElement('div'); t.className='t'; t.textContent=v.title;
+  const c=document.createElement('div'); c.className='c'; c.textContent=[v.ch,fmt(v.dur)].filter(Boolean).join(' · ');
+  const b=document.createElement('div'); b.className='b';
+  [['mp3','🎵 MP3'],['mp4','🎬 MP4']].forEach(([f,l])=>{const x=document.createElement('button'); x.textContent=l; x.onclick=()=>start(v,f); b.appendChild(x);});
+  i.appendChild(t); i.appendChild(c); i.appendChild(b); r.appendChild(im); r.appendChild(i); $('res').appendChild(r);
+}
+async function start(v,fmtx){
+  const d=await api('/api/start',{method:'POST',headers:Object.assign({'Content-Type':'application/json'},HD),body:JSON.stringify({id:v.id,fmt:fmtx})});
+  if(d.error){alert(d.error);return;}
+  $('hj').hidden=false;
+  const el=document.createElement('div'); el.className='job';
+  el.innerHTML='<div class="n"></div><progress max="100" value="0"></progress><div class="s">En cola...</div>';
+  el.querySelector('.n').textContent=(fmtx==='mp3'?'🎵 ':'🎬 ')+v.title;
+  $('jobs').prepend(el); track(d.job,el);
+}
+function track(id,el){
+  const pr=el.querySelector('progress'), st=el.querySelector('.s');
+  const tick=async()=>{
+    const d=await api('/api/job?id='+id);
+    if(d.error){st.textContent='✘ '+d.error;el.classList.add('er');return;}
+    pr.value=d.pct||0;
+    if(d.status==='done'){
+      el.classList.add('ok'); pr.value=100; st.innerHTML='✔ Listo · ';
+      const a=document.createElement('a'); a.href='/dl/'+encodeURIComponent(d.file)+'?dl=1'; a.setAttribute('download',d.file); a.textContent='⬇ Guardar en este dispositivo';
+      st.appendChild(a);
+      const mp4=/\.(mp4|webm|mkv)$/i.test(d.file);
+      const m=document.createElement(mp4?'video':'audio'); m.controls=true; m.preload='metadata'; if(mp4)m.playsInline=true; m.src='/dl/'+encodeURIComponent(d.file);
+      el.appendChild(m); loadLib(); return;
+    }
+    if(d.status==='error'){el.classList.add('er');st.textContent='✘ '+(d.msg||'Error');return;}
+    st.textContent=(d.msg||(d.status==='queued'?'En cola...':'Descargando '+Math.round(d.pct||0)+'%'));
+    setTimeout(tick,1000);
+  };
+  tick();
+}
+async function loadLib(){
+  const d=await api('/api/files'); const box=$('lib'); box.innerHTML='';
+  const L=d.files||[]; if(!L.length){box.innerHTML='<div class="msg">Aún no hay descargas.</div>';return;}
+  L.forEach(f=>{
+    const row=document.createElement('div'); row.className='lib';
+    const t=document.createElement('div'); t.className='t'; t.textContent=f.n+'  ('+sz(f.s)+')';
+    const a=document.createElement('a'); a.href='/dl/'+encodeURIComponent(f.n)+'?dl=1'; a.setAttribute('download',f.n); a.textContent='⬇';
+    t.onclick=()=>{
+      if(row.querySelector('audio,video'))return;
+      const mp4=/\.(mp4|webm|mkv)$/i.test(f.n);
+      const m=document.createElement(mp4?'video':'audio'); m.controls=true; m.autoplay=true; if(mp4)m.playsInline=true; m.src='/dl/'+encodeURIComponent(f.n);
+      row.style.flexWrap='wrap'; row.appendChild(m);
+    };
+    row.appendChild(t); row.appendChild(a); box.appendChild(row);
+  });
+}
+loadLib();
+</script></body></html>'''
+
+
+class H(SimpleHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'          # conexiones persistentes (mucho más rápido por túnel)
+
+    def setup(self):
+        super().setup()
+        try:
+            self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
+    def auth(self):
+        if not PASS:
+            return True
+        h = self.headers.get('Authorization', '')
+        if h.startswith('Basic '):
+            try:
+                pw = base64.b64decode(h[6:]).decode('utf-8', 'replace').partition(':')[2]
+                if hmac.compare_digest(pw.encode(), PASS.encode()):
+                    return True
+            except Exception:
+                pass
+        self.send_response(401)
+        self.send_header('WWW-Authenticate', 'Basic realm="BarbaShare", charset="UTF-8"')
+        self.send_header('Content-Length', '0')
+        if self.command in ('PUT', 'POST'):
+            self.send_header('Connection', 'close')
+        self.end_headers()
+        return False
+
+    def do_GET(self):
+        self.serve(False)
+
+    def do_HEAD(self):
+        self.serve(True)
+
+    def send_json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def api_ok(self):
+        if self.headers.get('X-BS') == '1':
+            return True
+        self.send_json({'error': 'Petición no válida'}, 403)
+        return False
+
+    def do_POST(self):
+        self.close_connection = True
+        if MODE != 'tube':
+            self.send_error(405, 'No permitido')
+            return
+        if not self.auth():
+            return
+        path = self.path.split('?', 1)[0]
+        if path != '/api/start' or not self.api_ok():
+            if path != '/api/start':
+                self.send_error(404, 'No encontrado')
+            return
+        if YT is None:
+            self.send_json({'error': 'yt-dlp no está instalado en este dispositivo'}, 500)
+            return
+        try:
+            n = int(self.headers.get('Content-Length', '0'))
+            if n < 0 or n > 4096:
+                raise ValueError
+            data = json.loads(self.rfile.read(n) or b'{}')
+        except Exception:
+            self.send_json({'error': 'Datos no válidos'}, 400)
+            return
+        vid = extract_id(str(data.get('id', '')))
+        fmt = data.get('fmt')
+        if not vid or fmt not in ('mp3', 'mp4'):
+            self.send_json({'error': 'Datos no válidos'}, 400)
+            return
+        jid = uuid.uuid4().hex[:10]
+        with JOBS_LOCK:
+            for k in list(JOBS)[:-50]:
+                JOBS.pop(k, None)
+            JOBS[jid] = {'status': 'queued', 'pct': 0, 'msg': ''}
+        threading.Thread(target=run_job, args=(jid, vid, fmt), daemon=True).start()
+        self.close_connection = False
+        self.send_json({'job': jid})
+
+    def tube_get(self, path, head):
+        q = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        if path == '/':
+            body = (TUBE.replace('__AVISO__', html.escape(AVISO))
+                    .replace('__CREDITO__', CREDITO).encode('utf-8'))
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+            return
+        if path.startswith('/api/'):
+            if not self.api_ok():
+                return
+            if path == '/api/files':
+                self.send_json({'files': list_library()})
+                return
+            if path == '/api/job':
+                j = JOBS.get((q.get('id') or [''])[0])
+                if not j:
+                    self.send_json({'error': 'Descarga no encontrada'}, 404)
+                    return
+                self.send_json({'status': j['status'], 'pct': j.get('pct', 0),
+                                'msg': j.get('msg', ''), 'file': j.get('file')})
+                return
+            if path in ('/api/search', '/api/info'):
+                if YT is None:
+                    self.send_json({'error': 'yt-dlp no está instalado en este dispositivo'}, 500)
+                    return
+                try:
+                    if path == '/api/search':
+                        self.send_json({'results': yt_search((q.get('q') or [''])[0])})
+                    else:
+                        vid = extract_id((q.get('q') or [''])[0])
+                        if not vid:
+                            self.send_json({'error': 'Enlace de YouTube no válido'}, 400)
+                        else:
+                            self.send_json({'results': [yt_info(vid)]})
+                except subprocess.TimeoutExpired:
+                    self.send_json({'error': 'YouTube tardó demasiado en responder'}, 504)
+                except Exception:
+                    self.send_json({'error': 'No se pudo consultar YouTube (¿hay internet? ¿yt-dlp al día?)'}, 502)
+                return
+            self.send_json({'error': 'No encontrado'}, 404)
+            return
+        if path.startswith('/dl/'):
+            name = urllib.parse.unquote(path[4:])
+            fp = os.path.join(DEST, name)
+            if (not name or '/' in name or '\\' in name or name.startswith('.') or '\x00' in name
+                    or os.path.splitext(name)[1].lower() not in LIB_EXT
+                    or not os.path.isfile(fp)
+                    or not os.path.realpath(fp).startswith(os.path.realpath(DEST) + os.sep)):
+                self.send_error(404, 'No encontrado')
+                return
+            self.send_file(fp, head, attach=('dl' in q))
+            return
+        self.send_error(404, 'No encontrado')
+
+    def do_PUT(self):
+        if MODE != 'recv':
+            self.close_connection = True
+            self.send_error(405, 'No permitido')
+            return
+        if not self.auth():
+            return
+        u = urllib.parse.urlsplit(self.path)
+        if u.path != '/upload':
+            self.send_error(404, 'No encontrado')
+            return
+        name = safe_name((urllib.parse.parse_qs(u.query).get('name') or ['archivo'])[0])
+        try:
+            n = int(self.headers.get('Content-Length', ''))
+        except ValueError:
+            self.send_error(411, 'Falta Content-Length')
+            return
+        os.makedirs(DEST, exist_ok=True)
+        final = unique(os.path.join(DEST, name))
+        tmp = final + '.part'
+        try:
+            with open(tmp, 'wb') as f:
+                left = n
+                while left > 0:
+                    chunk = self.rfile.read(min(1 << 20, left))
+                    if not chunk:
+                        raise ConnectionError('corte')
+                    f.write(chunk)
+                    left -= len(chunk)
+            os.replace(tmp, final)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            self.send_error(500, 'No se pudo guardar')
+            return
+        sys.stderr.write('RECIBIDO %s\n' % os.path.basename(final))
+        sys.stderr.flush()
+        body = json.dumps({'ok': True, 'name': os.path.basename(final)}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def serve(self, head):
+        if not self.auth():
+            return
+        path = self.path.split('?', 1)[0].split('#', 1)[0]
+        if MODE == 'tube':
+            self.tube_get(path, head)
+            return
+        if MODE == 'recv':
+            if path == '/':
+                body = UPLOAD.replace('__CREDITO__', CREDITO).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                if not head:
+                    self.wfile.write(body)
+            else:
+                self.send_error(404, 'No encontrado')
+            return
+        if PLAYER and path == '/':
+            body = page().encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            if not head:
+                self.wfile.write(body)
+            return
+        fp = self.translate_path(self.path)
+        if os.path.isdir(fp):
+            self.close_connection = True
+            if head:
+                SimpleHTTPRequestHandler.do_HEAD(self)
+            else:
+                SimpleHTTPRequestHandler.do_GET(self)
+            return
+        if not os.path.isfile(fp):
+            self.send_error(404, 'No encontrado')
+            return
+        self.send_file(fp, head)
+
+    def guess_type(self, path):
+        t = super().guess_type(path)
+        if t.startswith('text/') and 'charset' not in t:
+            t += '; charset=utf-8'
+        return t
+
+    def send_file(self, fp, head, attach=False):
+        try:
+            f = open(fp, 'rb')
+        except OSError:
+            self.send_error(404, 'No encontrado')
+            return
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            start, end, code = 0, size - 1, 200
+            rng = self.headers.get('Range')
+            if rng:
+                m = re.match(r'bytes=(\d*)-(\d*)$', rng.strip())
+                if m and (m.group(1) or m.group(2)):
+                    if m.group(1):
+                        start = int(m.group(1))
+                        if m.group(2):
+                            end = min(int(m.group(2)), size - 1)
+                    else:
+                        start = max(size - int(m.group(2)), 0)
+                    if start >= size or start > end:
+                        self.send_response(416)
+                        self.send_header('Content-Range', 'bytes */%d' % size)
+                        self.send_header('Content-Length', '0')
+                        self.end_headers()
+                        return
+                    code = 206
+            length = end - start + 1 if size else 0
+            self.send_response(code)
+            self.send_header('Content-Type', self.guess_type(fp))
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Content-Length', str(length))
+            self.send_header('Cache-Control', 'private, max-age=3600')
+            if attach:
+                nm = os.path.basename(fp)
+                self.send_header('Content-Disposition', "attachment; filename*=UTF-8''" + urllib.parse.quote(nm))
+            if code == 206:
+                self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, end, size))
+            self.end_headers()
+            if head:
+                return
+            try:
+                self.wfile.flush()
+                try:
+                    self.connection.sendfile(f, start, length)      # envío directo del kernel
+                except (AttributeError, NotImplementedError, OSError) as e:
+                    if isinstance(e, (BrokenPipeError, ConnectionResetError)):
+                        raise
+                    f.seek(start)
+                    left = length
+                    while left > 0:
+                        chunk = f.read(min(262144, left))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
+            except (BrokenPipeError, ConnectionResetError, TimeoutError):
+                self.close_connection = True
+
+
+ThreadingHTTPServer.request_queue_size = 128
+srv = ThreadingHTTPServer((BIND, PORT), functools.partial(H, directory=ROOT))
+srv.daemon_threads = True
+try:
+    srv.serve_forever()
+except KeyboardInterrupt:
+    pass
+PYEOF
+}
+
+tiene_media() {
+    find -L "$TMPD" -type f \( -iname '*.mp3' -o -iname '*.wav' -o -iname '*.m4a' \
+        -o -iname '*.ogg' -o -iname '*.oga' -o -iname '*.flac' -o -iname '*.aac' -o -iname '*.opus' \
+        -o -iname '*.mp4' -o -iname '*.webm' -o -iname '*.mkv' -o -iname '*.mov' -o -iname '*.m4v' \
+        -o -iname '*.3gp' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' -o -iname '*.gif' \
+        -o -iname '*.webp' \) -print -quit 2>/dev/null | grep -q .
+}
+
+iniciar_servidor() {
+    PORT=$(puerto_libre) || { err "No encontré un puerto libre"; return 1; }
+    PLAYER=0
+    BIND="127.0.0.1"
+    [[ "$METODO" == "local" ]] && BIND="0.0.0.0"
+    if [[ "$MODO" == "share" ]] && ! $PLAYER_OFF && tiene_media; then PLAYER=1; fi
+    escribir_servidor
+    COMPARTIR_PASS="$PASSWORD" "$PY" "$TMPD.srv.py" "$PORT" "$TMPD" "$PLAYER" "$BIND" "$MODO" "${DEST_RECV:-$TMPD}" >"$SLOG" 2>&1 &
+    SERVER_PID=$!
+    local i
+    for ((i = 0; i < 20; i++)); do
+        kill -0 "$SERVER_PID" 2>/dev/null || break
+        if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    err "El servidor local no arrancó"
+    [[ -s "$SLOG" ]] && tail -n 5 "$SLOG"
+    return 1
+}
+
+# ==========================================================
+#  Túneles  (cada uno deja RE / NOMBRE y lanza el proceso)
+# ==========================================================
+asegurar_cloudflared() {
+    command -v cloudflared >/dev/null 2>&1 && return 0
+    if $IS_TERMUX; then
+        instalar_pkg cloudflared cloudflared
+        return $?
+    fi
+    local arch bin="$HOME/.local/bin"
+    case "$(uname -m)" in
+        x86_64)              arch="amd64" ;;
+        aarch64|arm64)       arch="arm64" ;;
+        armv7l|armv8l|arm*)  arch="arm"   ;;
+        *) err "Arquitectura no soportada: $(uname -m)"; return 1 ;;
+    esac
+    command -v curl >/dev/null 2>&1 || instalar_pkg curl curl || return 1
+    mkdir -p "$bin"
+    info "Descargando cloudflared..."
+    if curl -fsSL -o "$bin/cloudflared" \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$arch"; then
+        chmod +x "$bin/cloudflared"
+        export PATH="$bin:$PATH"
+        return 0
+    fi
+    err "No se pudo descargar cloudflared"
+    return 1
+}
+
+lanzar_tunel() {
+    local m="$1"
+    : > "$TLOG"
+    READY_RE=""
+    case "$m" in
+        cloudflared)
+            NOMBRE="Cloudflare"
+            RE='https://[a-z0-9-]+\.trycloudflare\.com'
+            READY_RE='Registered tunnel connection'
+            asegurar_cloudflared || return 1
+            cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$PORT" \
+                <&9 >"$TLOG" 2>&1 &
+            ;;
+        pinggy)
+            NOMBRE="Pinggy"
+            RE='https://[A-Za-z0-9.-]+\.pinggy\.(link|online|io)'
+            instalar_pkg ssh openssh openssh-client || return 1
+            ssh "${SSH_OPTS[@]}" -p 443 -R0:127.0.0.1:"$PORT" a.pinggy.io \
+                <&9 >"$TLOG" 2>&1 &
+            ;;
+        lhr)
+            NOMBRE="localhost.run"
+            RE='https://[a-z0-9-]+\.lhr\.life'
+            instalar_pkg ssh openssh openssh-client || return 1
+            ssh "${SSH_OPTS[@]}" -R 80:127.0.0.1:"$PORT" nokey@localhost.run \
+                <&9 >"$TLOG" 2>&1 &
+            ;;
+        serveo)
+            NOMBRE="Serveo"
+            RE='https://[a-z0-9-]+\.serveo(usercontent)?\.(net|com)'
+            instalar_pkg ssh openssh openssh-client || return 1
+            ssh "${SSH_OPTS[@]}" -R 80:127.0.0.1:"$PORT" serveo.net \
+                <&9 >"$TLOG" 2>&1 &
+            ;;
+        tuns)
+            NOMBRE="tuns.sh"
+            RE='https://[a-z0-9-]+\.tuns\.sh'
+            instalar_pkg ssh openssh openssh-client || return 1
+            ssh "${SSH_OPTS[@]}" -R 80:127.0.0.1:"$PORT" tuns.sh \
+                <&9 >"$TLOG" 2>&1 &
+            ;;
+        lt)
+            NOMBRE="Localtunnel"
+            RE='https://[a-z0-9-]+\.loca\.lt'
+            instalar_pkg npx nodejs nodejs || return 1
+            npx --yes localtunnel --port "$PORT" \
+                <&9 >"$TLOG" 2>&1 &
+            ;;
+        *)
+            err "Método desconocido: $m"
+            return 1
+            ;;
+    esac
+    TUNNEL_PID=$!
+    return 0
+}
+
+esperar_url() {
+    local i u
+    URL_BASE=""
+    for ((i = 1; i <= 45; i++)); do
+        kill -0 "$TUNNEL_PID" 2>/dev/null || break
+        u=$(limpiar_log "$TLOG" | grep -oE "$RE" \
+            | grep -vE '^https://(api|dashboard|docs|www)\.' | head -n1)
+        if [[ -n "$u" ]]; then URL_BASE="$u"; break; fi
+        $QUIET || printf '\r   esperando enlace... %ss ' "$i"
+        sleep 1
+    done
+    $QUIET || printf '\r\033[K'
+    [[ -n "$URL_BASE" ]] || return 1
+    # Espera (máx. 12 s) a que el túnel esté realmente registrado
+    if [[ -n "$READY_RE" ]]; then
+        for ((i = 0; i < 12; i++)); do
+            limpiar_log "$TLOG" | grep -qE "$READY_RE" && break
+            sleep 1
+        done
+    fi
+    return 0
+}
+
+# ==========================================================
+#  Mostrar enlace y mantener activo
+# ==========================================================
+recibidos() {
+    grep -c '^RECIBIDO ' "$SLOG" 2>/dev/null
+}
+
+descargas() {
+    grep -E '"GET /[^ ]' "$SLOG" 2>/dev/null | grep -v favicon | grep -c ' 200 '
+}
+
+mostrar_enlace() {
+    local url="$1" direct="${2:-}" f
+    if [[ "$MODO" == "tube" ]]; then
+        titulo "🎬 YOUTUBE LISTO  ($NOMBRE)"
+        printf ' 📂 Las descargas se guardan en:\n    %s\n\n' "$(short "$DEST_RECV")"
+        if [[ "$METODO" == "self" ]]; then
+            printf ' %s🌐 Ábrelo en el navegador de este móvil:%s\n\n' "$C_G" "$C_0"
+        else
+            printf ' %s🔗 Abre este enlace para buscar y descargar:%s\n\n' "$C_G" "$C_0"
+        fi
+    elif [[ "$MODO" == "recv" ]]; then
+        titulo "📥 LISTO PARA RECIBIR  ($NOMBRE)"
+        printf ' 📂 Se guardan en:\n    %s\n\n' "$(short "$DEST_RECV")"
+        printf ' %s🔗 Pásale este enlace a quien te envía:%s\n\n' "$C_G" "$C_0"
+    else
+        titulo "✅ ENLACE LISTO  ($NOMBRE)"
+        for f in "${SEL[@]}"; do
+            if [[ -d "$f" ]]; then
+                printf ' 📁 %s/ %s(%s)%s\n' "$(recortar "$(basename -- "$f")" 24)" "$C_D" "$(tamano_dir "$f")" "$C_0"
+                [[ "$FOLDER_MODE" == "zip" ]] && dim "    (se descarga como .zip)"
+            else
+                printf ' %s %s %s(%s)%s\n' "$(icono "$f")" "$(recortar "$(basename -- "$f")" 30)" "$C_D" "$(tamano "$f")" "$C_0"
+            fi
+        done
+        echo
+        if [[ "$PLAYER" == "1" ]]; then
+            printf ' %s🎧 Enlace con reproductor:%s\n\n' "$C_G" "$C_0"
+        else
+            printf ' %s🔗 Envía este enlace:%s\n\n' "$C_G" "$C_0"
+        fi
+    fi
+    printf '%s%s%s\n\n' "$C_C" "$url" "$C_0"
+    if [[ -n "$direct" ]]; then
+        printf ' %s⬇ Descarga directa:%s\n\n' "$C_G" "$C_0"
+        printf '%s%s%s\n\n' "$C_C" "$direct" "$C_0"
+    fi
+    if [[ -n "$PASSWORD" ]]; then
+        printf ' %s🔑 Contraseña:%s %s%s%s\n' "$C_Y" "$C_0" "$C_W" "$PASSWORD" "$C_0"
+        dim "    (usuario: el que sea · envíala aparte)"
+    fi
+    (( EXPIRA_MIN > 0 )) && printf ' %s⏳ Se cierra solo en %s min%s\n' "$C_Y" "$EXPIRA_MIN" "$C_0"
+    (( MAX_ACCESOS > 0 )) && printf ' %s🎯 Se cierra tras %s apertura(s)%s\n' "$C_Y" "$MAX_ACCESOS" "$C_0"
+    bar
+    if command -v termux-clipboard-set >/dev/null 2>&1; then
+        if printf '%s' "$url" | timeout 3 termux-clipboard-set 2>/dev/null; then
+            ok "Enlace copiado al portapapeles"
+        fi
+    fi
+    if command -v qrencode >/dev/null 2>&1; then
+        qrencode -t ANSIUTF8 -m 1 "$url" 2>/dev/null
+    fi
+    if [[ "$METODO" == "local" ]]; then
+        warn "Solo funciona en tu mismo Wi-Fi/hotspot."
+    elif [[ "$MODO" == "tube" ]]; then
+        dim " Quien tenga el enlace usa tu conexión y tu espacio."
+        dim " Solo contenido tuyo o con permiso del autor."
+    elif [[ "$MODO" == "recv" ]]; then
+        dim " Cualquiera con el enlace puede enviarte archivos."
+    else
+        dim " Cualquiera con el enlace puede descargar."
+    fi
+    if $IS_TERMUX; then
+        dim " Mantén Termux abierto (ya evita dormirse)."
+        warn "Para parar: Volumen↓ + C   (o CTRL + C)"
+    else
+        warn "Para parar: Ctrl + C"
+    fi
+    dim " BarbaShare v$VERSION · by $AUTOR"
+    bar
+}
+
+mantener() {
+    local n n0=0 r r0=0 limite=0 nuevo pat
+    HOLDING=true
+    STOP=false
+    (( EXPIRA_MIN > 0 )) && limite=$(( SECONDS + EXPIRA_MIN * 60 ))
+    while ! $STOP; do
+        if [[ -n "$TUNNEL_PID" ]] && ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            warn "El túnel se cerró."
+            break
+        fi
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            warn "El servidor local se detuvo."
+            break
+        fi
+        if (( limite > 0 && SECONDS >= limite )); then
+            warn "⏳ Se cumplió el tiempo ($EXPIRA_MIN min)."
+            break
+        fi
+        if [[ "$MODO" == "recv" || "$MODO" == "tube" ]]; then
+            pat="RECIBIDO"; [[ "$MODO" == "tube" ]] && pat="DESCARGADO"
+            r=$(grep -c "^$pat " "$SLOG" 2>/dev/null)
+            if (( r > r0 )); then
+                while IFS= read -r nuevo; do
+                    if [[ "$MODO" == "tube" ]]; then
+                        ok "⬇ Descargado: ${nuevo#"$pat "} $(date +%H:%M:%S)"
+                    else
+                        ok "📥 Recibido: ${nuevo#"$pat "} $(date +%H:%M:%S)"
+                    fi
+                    avisar "${nuevo#"$pat "}"
+                done < <(grep "^$pat " "$SLOG" | tail -n +$(( r0 + 1 )))
+                r0=$r
+            fi
+        else
+            n=$(descargas)
+            if (( n > n0 )); then
+                ok "👀 Alguien abrió un archivo ($n) $(date +%H:%M:%S)"
+                avisar "Alguien abrió tu enlace ($n)"
+                n0=$n
+            fi
+            if (( MAX_ACCESOS > 0 && n >= MAX_ACCESOS )); then
+                warn "🎯 Límite de aperturas alcanzado."
+                sleep 2
+                break
+            fi
+        fi
+        sleep 2
+    done
+    HOLDING=false
+}
+
+# ==========================================================
+#  Compartir
+# ==========================================================
+elegir_modo_carpeta() {
+    local f hay=false r
+    FOLDER_MODE="lista"
+    for f in "${SEL[@]}"; do [[ -d "$f" ]] && hay=true; done
+    $hay || return 0
+    $ZIP_FIXED && { FOLDER_MODE="zip"; return 0; }
+    titulo "📁 COMPARTIR CARPETA"
+    opcion 1 "Lista navegable (ver y bajar cada archivo)"
+    opcion 2 "Un solo .zip (un único enlace)"
+    echo
+    warn "Se publica TODO lo de dentro,"
+    warn "incluidas las subcarpetas."
+    dim " Enter = lista navegable"
+    while true; do
+        read -rp " ➜ " r || exit 0
+        case "$r" in
+            ""|1) FOLDER_MODE="lista"; return 0 ;;
+            2)    FOLDER_MODE="zip";   return 0 ;;
+            *)    warn "Elige 1 o 2" ;;
+        esac
+    done
+}
+
+compartir() {
+    local m lista conectado=false url nombre ip direct=""
+    MODO="${1:-share}"
+    if [[ "$MODO" != "share" ]]; then
+        SEL=(); NAMES=()
+    else
+        elegir_modo_carpeta
+    fi
+    preparar_carpeta || { parar_todo; return 1; }
+    if ! iniciar_servidor; then
+        parar_todo
+        read -rp " ENTER para continuar..." _
+        return 1
+    fi
+
+    titulo "🚀 CREANDO ENLACE"
+    if [[ "$METODO" == "self" ]]; then
+        NOMBRE="Este dispositivo"
+        URL_BASE="http://127.0.0.1:$PORT"
+        TUNNEL_PID=""
+        conectado=true
+    elif [[ "$METODO" == "local" ]]; then
+        ip=$(ip_local)
+        if [[ -z "$ip" ]]; then
+            err "No encontré tu IP de Wi-Fi. ¿Estás conectado a una red?"
+        else
+            NOMBRE="Red local"
+            URL_BASE="http://$ip:$PORT"
+            TUNNEL_PID=""
+            conectado=true
+        fi
+    else
+        case "$METODO" in
+            auto|"") lista=($(orden_metodos)) ;;
+            *)       lista=("$METODO") ;;
+        esac
+        for m in "${lista[@]}"; do
+            if lanzar_tunel "$m"; then
+                info "Conectando con $NOMBRE..."
+                if esperar_url; then
+                    conectado=true
+                    break
+                fi
+                warn "$NOMBRE no respondió"
+                [[ -s "$TLOG" ]] && limpiar_log "$TLOG" | grep -v '^\s*$' | tail -n 3
+                detener_tunel
+            fi
+        done
+    fi
+
+    if ! $conectado; then
+        err "No se pudo crear el enlace."
+        dim "Revisa tu conexión o prueba otro método (o 'Red local')."
+        parar_todo
+        read -rp " ENTER para continuar..." _
+        return 1
+    fi
+
+    if [[ "$MODO" != "share" ]]; then
+        url="$URL_BASE/"
+    else
+        if (( ${#NAMES[@]} == 1 )); then
+            nombre="${NAMES[0]}"
+            url="$URL_BASE/$(urlenc "${nombre%/}")"
+            [[ "$nombre" == */ ]] && url="$url/"
+        else
+            url="$URL_BASE/"
+        fi
+        if [[ "$PLAYER" == "1" ]]; then
+            [[ "$url" != "$URL_BASE/" && "$nombre" != */ ]] && direct="$url"
+            url="$URL_BASE/"
+        fi
+    fi
+
+    mostrar_enlace "$url" "$direct"
+    if [[ "$MODO" == "tube" && "$METODO" == "self" ]] && command -v termux-open-url >/dev/null 2>&1; then
+        timeout 5 termux-open-url "$url" >/dev/null 2>&1 &
+    fi
+    mantener
+    parar_todo
+    echo
+    if [[ "$MODO" == "recv" ]]; then
+        ok "Dejaste de recibir. El enlace ya no funciona."
+    elif [[ "$MODO" == "tube" ]]; then
+        ok "Cerraste el panel de YouTube."
+    else
+        ok "Dejaste de compartir. El enlace ya no funciona."
+    fi
+    MODO="share"
+    return 0
+}
+
+# ==========================================================
+#  Menús
+# ==========================================================
+elegir_metodo() {
+    titulo "¿CÓMO QUIERES COMPARTIR?"
+    opcion 1 "Automático (recomendado)"
+    opcion 2 "Cloudflare  (estable, sin cuenta)"
+    opcion 3 "Pinggy      (rápido, SSH)"
+    opcion 4 "localhost.run (SSH)"
+    opcion 5 "Serveo      (SSH)"
+    opcion 6 "tuns.sh     (SSH)"
+    opcion 7 "Localtunnel (Node.js)"
+    opcion 8 "Red local   (mismo Wi-Fi, sin internet)"
+    echo
+    dim " Enter = automático"
+    local r
+    while true; do
+        read -rp " ➜ " r || exit 0
+        case "$r" in
+            ""|1) METODO="auto";        return 0 ;;
+            2)    METODO="cloudflared"; return 0 ;;
+            3)    METODO="pinggy";      return 0 ;;
+            4)    METODO="lhr";         return 0 ;;
+            5)    METODO="serveo";      return 0 ;;
+            6)    METODO="tuns";        return 0 ;;
+            7)    METODO="lt";          return 0 ;;
+            8)    METODO="local";       return 0 ;;
+            *)    warn "Elige un número del 1 al 8" ;;
+        esac
+    done
+}
+
+nombre_carpeta() {
+    case "$1" in
+        "$HOME/storage/downloads") echo "📥 Descargas" ;;
+        "$HOME/storage/dcim")      echo "📷 Cámara (DCIM)" ;;
+        "$HOME/storage/pictures")  echo "🖼 Imágenes" ;;
+        "$HOME/storage/movies")    echo "🎬 Videos" ;;
+        "$HOME/storage/music")     echo "🎵 Música" ;;
+        "$HOME/storage/shared")    echo "📱 Almacenamiento interno" ;;
+        "$HOME")                   echo "🏠 Carpeta de Termux (~)" ;;
+        *)                         echo "📁 $(short "$1")" ;;
+    esac
+}
+
+# Devuelve: 0 = carpeta elegida en $CHOSEN | 3 = archivo elegido en $SEL | 1 = salir
+menu_carpetas() {
+    local d i r p cand=()
+    if $IS_TERMUX; then
+        [[ -d "$HOME/storage/shared" ]] || permiso_almacenamiento
+        for d in downloads dcim pictures movies music shared; do
+            [[ -d "$HOME/storage/$d" ]] && cand+=("$HOME/storage/$d")
+        done
+    else
+        for d in Downloads Descargas Documents Documentos Pictures Imágenes Music Música Videos Desktop; do
+            [[ -d "$HOME/$d" ]] && cand+=("$HOME/$d")
+        done
+    fi
+    cand+=("$HOME")
+    [[ "$PWD" != "$HOME" ]] && cand+=("$PWD")
+
+    while true; do
+        titulo "📂 ¿DE QUÉ CARPETA?"
+        i=0
+        for d in "${cand[@]}"; do
+            ((i++))
+            opcion "$i" "$(nombre_carpeta "$d")"
+        done
+        echo
+        dim " r = escribir una ruta  ·  q = salir"
+        read -rp " ➜ " r || return 1
+        case "${r,,}" in
+            q) return 1 ;;
+            r)
+                read -rp " Ruta: " p || return 1
+                p="${p/#\~/$HOME}"
+                if [[ -d "$p" ]]; then CHOSEN="$(readlink -f -- "$p")"; return 0; fi
+                if [[ -f "$p" ]]; then SEL=("$(readlink -f -- "$p")"); return 3; fi
+                warn "Esa ruta no existe"; sleep 1
+                ;;
+            *)
+                if [[ "$r" =~ ^[0-9]+$ ]]; then
+                    r=$((10#$r))
+                    if (( r >= 1 && r <= ${#cand[@]} )); then
+                        CHOSEN="${cand[r-1]}"
+                        return 0
+                    fi
+                fi
+                warn "Opción no válida"; sleep 1
+                ;;
+        esac
+    done
+}
+
+# Devuelve 0 con $SEL lleno, o 1 si el usuario sale.
+navegar() {
+    local dir="$1" rc
+    while true; do
+        if [[ -z "$dir" ]]; then
+            menu_carpetas; rc=$?
+            case $rc in
+                0) dir="$CHOSEN" ;;
+                3) return 0 ;;
+                *) return 1 ;;
+            esac
+        fi
+
+        local subs=() files=() ent=() kind=() e i=0 ans tok p bad=false
+        while IFS= read -r e; do
+            [[ -z "$e" ]] && continue
+            if [[ "$e" == */ ]]; then subs+=("${e%/}"); else files+=("$e"); fi
+        done < <(cd -- "$dir" 2>/dev/null && ls -1tp 2>/dev/null)
+
+        titulo "📂 $(short "$dir")"
+        if [[ ! -r "$dir" ]]; then warn "No puedo leer esta carpeta"; fi
+        if (( ${#subs[@]} + ${#files[@]} == 0 )); then dim " (carpeta vacía)"; fi
+
+        for e in "${subs[@]:0:15}"; do
+            ((i++)); ent[i]="${dir%/}/$e"; kind[i]="d"
+            printf ' %s[%d]%s 📁 %s/\n' "$C_G" "$i" "$C_0" "$(recortar "$e" 32)"
+        done
+        for e in "${files[@]:0:30}"; do
+            ((i++)); ent[i]="${dir%/}/$e"; kind[i]="f"
+            printf ' %s[%d]%s %s %s %s(%s)%s\n' "$C_G" "$i" "$C_0" "$(icono "$e")" \
+                "$(recortar "$e" 26)" "$C_D" "$(tamano "${ent[i]}")" "$C_0"
+        done
+        if (( ${#files[@]} > 30 )); then dim " ... y $(( ${#files[@]} - 30 )) archivos más (los más nuevos arriba)"; fi
+        echo
+        dim " Varios archivos: 2 5 7"
+        dim " s = compartir ESTA carpeta"
+        dim " c 2 = compartir la carpeta/archivo 2"
+        dim " u = subir · 0 = otra carpeta · q = salir"
+        read -rp " ➜ " ans || return 1
+
+        case "${ans,,}" in
+            q)  return 1 ;;
+            0)  dir=""; continue ;;
+            u)  dir="$(dirname -- "$dir")"; continue ;;
+            s)  SEL=("$(readlink -f -- "$dir")"); return 0 ;;
+            "") continue ;;
+        esac
+
+        # "c 2 3": comparte tal cual lo elegido (carpetas incluidas)
+        if [[ "${ans,,}" == c\ * ]]; then
+            SEL=(); bad=false
+            for tok in ${ans#* }; do
+                if [[ "$tok" =~ ^[0-9]+$ ]] && [[ -n "${ent[$((10#$tok))]:-}" ]]; then
+                    SEL+=("$(readlink -f -- "${ent[$((10#$tok))]}")")
+                else
+                    bad=true
+                fi
+            done
+            if $bad || (( ${#SEL[@]} == 0 )); then
+                warn "Opción no válida"; sleep 1; continue
+            fi
+            return 0
+        fi
+
+        local picks=() ndir=0; bad=false
+        for tok in $ans; do
+            if [[ "$tok" =~ ^[0-9]+$ ]]; then
+                tok=$((10#$tok))
+                if [[ -n "${ent[tok]:-}" ]]; then
+                    picks+=("$tok")
+                    [[ "${kind[tok]}" == "d" ]] && ((ndir++))
+                    continue
+                fi
+            fi
+            bad=true
+        done
+
+        if $bad || (( ${#picks[@]} == 0 )); then
+            warn "Opción no válida"; sleep 1; continue
+        fi
+        if (( ndir == 1 && ${#picks[@]} == 1 )); then
+            dir="${ent[${picks[0]}]}"; continue
+        fi
+        if (( ndir > 0 )); then
+            warn "No mezcles carpetas y archivos"; sleep 1; continue
+        fi
+        SEL=()
+        for p in "${picks[@]}"; do
+            SEL+=("$(readlink -f -- "${ent[p]}")")
+        done
+        return 0
+    done
+}
+
+# ==========================================================
+#  Ayuda y argumentos
+# ==========================================================
+ORDEN_FILE="$HOME/.barbashare_orden"
+
+orden_metodos() {
+    local todos="cloudflared pinggy lhr serveo tuns lt" m ord=""
+    if [[ -s "$ORDEN_FILE" ]]; then
+        for m in $(cat "$ORDEN_FILE"); do
+            case " $todos " in *" $m "*) ord="$ord $m" ;; esac
+        done
+    fi
+    for m in $todos; do
+        case " $ord " in *" $m "*) ;; *) ord="$ord $m" ;; esac
+    done
+    echo $ord
+}
+
+comprobar_url() {   # url  texto_esperado
+    "$PY" - "$1" "$2" <<'EOF'
+import sys, urllib.request
+try:
+    req = urllib.request.Request(sys.argv[1], headers={
+        "User-Agent": "Mozilla/5.0", "bypass-tunnel-reminder": "1"})
+    body = urllib.request.urlopen(req, timeout=20).read(300).decode("utf-8", "replace")
+    sys.exit(0 if sys.argv[2] in body else 2)
+except Exception:
+    sys.exit(1)
+EOF
+}
+
+probar_servidores() {
+    local m t0 dt i res tok PT buenos=() nombres=() orden
+    QUIET=true; MODO="share"; METODO="auto"
+    local old_off=$PLAYER_OFF; PLAYER_OFF=true
+    titulo "🧪 PRUEBA DE SERVIDORES"
+    dim " Prueba cada servidor en tu conexión."
+    dim " Puede tardar unos minutos. No cierres Termux."
+    echo
+    PT=$(mktemp -d "${TMPDIR:-/tmp}/probe.XXXXXX")
+    tok="barbashare-ok-$RANDOM$RANDOM"
+    printf '%s' "$tok" > "$PT/prueba.txt"
+    SEL=("$PT/prueba.txt")
+    preparar_carpeta || { rm -rf "$PT"; QUIET=false; PLAYER_OFF=$old_off; return 1; }
+    if ! iniciar_servidor; then
+        parar_todo; rm -rf "$PT"; QUIET=false; PLAYER_OFF=$old_off; return 1
+    fi
+    for m in cloudflared pinggy lhr serveo tuns lt; do
+        t0=$SECONDS
+        if ! lanzar_tunel "$m"; then
+            printf ' %s✘%s %-14s no se pudo preparar\n' "$C_R" "$C_0" "$m"
+            continue
+        fi
+        printf ' ⏳ %s...' "$NOMBRE"
+        res="no dio enlace"
+        if esperar_url; then
+            res="el enlace no responde"
+            for i in 1 2 3 4 5 6; do
+                if comprobar_url "$URL_BASE/prueba.txt" "$tok"; then res="ok"; break; fi
+                sleep 3
+            done
+        fi
+        dt=$(( SECONDS - t0 ))
+        printf '\r\033[K'
+        if [[ "$res" == "ok" ]]; then
+            printf ' %s✔%s %-14s funciona (%ss)\n' "$C_G" "$C_0" "$NOMBRE" "$dt"
+            buenos+=("$dt $m"); nombres+=("$NOMBRE")
+        else
+            printf ' %s✘%s %-14s %s\n' "$C_R" "$C_0" "$NOMBRE" "$res"
+        fi
+        detener_tunel
+    done
+    parar_todo
+    rm -rf "$PT"
+    echo
+    bar
+    if (( ${#buenos[@]} )); then
+        orden=$(printf '%s\n' "${buenos[@]}" | sort -n | awk '{print $2}' | tr '\n' ' ')
+        echo "$orden" > "$ORDEN_FILE"
+        ok "Funcionan ${#buenos[@]} de 6: ${nombres[*]}"
+        dim " El modo automático los usará primero."
+    else
+        rm -f "$ORDEN_FILE"
+        err "Ningún servidor funcionó ahora mismo."
+        dim " Revisa tu internet o usa el modo Wi-Fi: -m local"
+    fi
+    dim " Prueba hecha $(date +%H:%M) · BarbaShare by $AUTOR"
+    bar
+    QUIET=false; PLAYER_OFF=$old_off
+}
+
+instalar_ytdlp() {
+    local marca="$HOME/.barbashare_youtube_paquetes_v1"
+    # pip --user instala aquí: conservar el PATH también al omitir la revisión.
+    case ":$PATH:" in
+        *":$HOME/.local/bin:"*) ;;
+        *) export PATH="$HOME/.local/bin:$PATH" ;;
+    esac
+    # Una sola comprobación, incluso al cerrar y volver a abrir BarbaShare.
+    [[ "${YOUTUBE_PAQUETES_REVISADOS:-}" == "1" || -f "$marca" ]] && return 0
+    if ! command -v yt-dlp >/dev/null 2>&1; then
+        if $IS_TERMUX; then
+            instalar_pkg yt-dlp yt-dlp || return 1
+        else
+            info "Instalando yt-dlp..."
+            "$PY" -m pip install --user -U yt-dlp >/dev/null 2>&1 \
+                || "$PY" -m pip install --user --break-system-packages -U yt-dlp >/dev/null 2>&1
+            export PATH="$HOME/.local/bin:$PATH"
+            if ! command -v yt-dlp >/dev/null 2>&1; then
+                err "No se pudo instalar yt-dlp."
+                dim "Prueba:  pip install --user -U yt-dlp"
+                return 1
+            fi
+        fi
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        info "Instalando ffmpeg (para MP3 y video HD)..."
+        instalar_pkg ffmpeg ffmpeg >/dev/null 2>&1 \
+            || warn "Sin ffmpeg: el audio se guardará como .m4a"
+    fi
+    # ffmpeg es opcional: no repetir su instalación si ya se intentó.
+    YOUTUBE_PAQUETES_REVISADOS=1
+    if ! (umask 077; : > "$marca") 2>/dev/null; then
+        warn "No se pudo guardar la comprobación; se recordará solo durante esta ejecución."
+    fi
+    return 0
+}
+
+actualizar_ytdlp() {
+    info "Actualizando yt-dlp (YouTube cambia a menudo)..."
+    if $IS_TERMUX; then
+        pkg upgrade -y yt-dlp
+    else
+        "$PY" -m pip install --user -U yt-dlp || "$PY" -m pip install --user --break-system-packages -U yt-dlp
+    fi
+    command -v yt-dlp >/dev/null 2>&1 && yt-dlp --version
+}
+
+flujo_tube() {
+    local def r
+    titulo "🎬 YOUTUBE · BUSCAR Y DESCARGAR"
+    warn "Úsalo solo con contenido tuyo, de dominio"
+    warn "público, Creative Commons o con permiso."
+    dim " Descargar material protegido puede violar"
+    dim " los Términos de YouTube y el copyright."
+    echo
+    read -rp " ¿Continuar? [S/n]: " r || exit 0
+    [[ "${r,,}" == n* ]] && return 0
+    instalar_ytdlp || { read -rp " ENTER para volver..." _; return 1; }
+
+    if $IS_TERMUX; then
+        [[ -d "$HOME/storage/shared" ]] || permiso_almacenamiento
+        if [[ -d "$HOME/storage/downloads" ]]; then def="$HOME/storage/downloads/BarbaShare"; else def="$HOME/BarbaShare"; fi
+    else
+        def="$HOME/BarbaShare"
+    fi
+    titulo "📂 ¿DÓNDE GUARDAR?"
+    dim " Las descargas se guardarán en:"
+    printf ' %s\n\n' "$(short "$def")"
+    dim " Enter = aceptar · o escribe otra ruta"
+    read -rp " ➜ " r || exit 0
+    [[ -n "$r" ]] && def="${r/#\~/$HOME}"
+    mkdir -p -- "$def" 2>/dev/null || { err "No pude crear $def"; return 1; }
+    DEST_RECV="$(readlink -f -- "$def")"
+
+    if ! $METODO_FIJO; then
+        titulo "¿DESDE DÓNDE LO USARÁS?"
+        opcion 1 "Solo en este dispositivo (recomendado)"
+        opcion 2 "Con enlace público (túnel)"
+        opcion 3 "En mi Wi-Fi (otros dispositivos)"
+        echo
+        while true; do
+            read -rp " ➜ " r || exit 0
+            case "$r" in
+                ""|1) METODO="self"; break ;;
+                2)    elegir_metodo; break ;;
+                3)    METODO="local"; break ;;
+                *)    warn "Elige 1, 2 o 3" ;;
+            esac
+        done
+    fi
+    if [[ "$METODO" != "self" && -z "$PASSWORD" ]]; then
+        PASSWORD="$(aleatoria)"
+        warn "Se creó una contraseña automática: $PASSWORD"
+        dim " (si no, cualquiera usaría tu conexión)"
+        sleep 2
+    fi
+    compartir tube
+}
+
+instalar_comando() {
+    local dest src
+    if $IS_TERMUX; then dest="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+    elif [[ -w /usr/local/bin ]]; then dest="/usr/local/bin"
+    else dest="$HOME/.local/bin"; fi
+    src="$(readlink -f -- "$0")"
+    mkdir -p "$dest" || { err "No pude crear $dest"; return 1; }
+    cp -- "$src" "$dest/barbashare" && chmod +x "$dest/barbashare" \
+        || { err "No pude copiar el script a $dest"; return 1; }
+    ok "Instalado en $dest"
+    echo " Ahora escribe en cualquier carpeta:"
+    printf '   %sbarbashare%s\n' "$C_C" "$C_0"
+    case ":$PATH:" in
+        *":$dest:"*) ;;
+        *) warn "Añade $dest a tu PATH para que funcione." ;;
+    esac
+}
+
+desinstalar_comando() {
+    local d f n=0
+    for d in "${PREFIX:-/data/data/com.termux/files/usr}/bin" /usr/local/bin "$HOME/.local/bin"; do
+        for f in barbashare barba-share; do
+            [[ -e "$d/$f" || -L "$d/$f" ]] && rm -f -- "$d/$f" && { ok "Borrado $d/$f"; ((n++)); }
+        done
+    done
+    (( n )) || warn "No encontré nada instalado."
+}
+
+uso() {
+    cat <<EOF
+BarbaShare v$VERSION  ·  por $AUTOR
+
+Uso:
+  $(basename "$0") [opciones] [archivo|carpeta ...]
+
+Opciones:
+  -m, --metodo M     auto (por defecto) | cloudflared | pinggy | lhr
+                     | serveo | tuns | lt | local (solo tu Wi-Fi)
+                     | self (solo este dispositivo)
+  -p, --clave [X]    Protege con contraseña (X, o 'auto' para generarla)
+  -t, --tiempo N     Se cierra solo a los N minutos
+  -x, --max N        Se cierra tras N aperturas/descargas
+  -z, --zip          Las carpetas se comparten como un único .zip
+  -n, --sin-reproductor  No crear el reproductor web
+  -r, --recibir      Recibir archivos (opcional: carpeta destino)
+      --youtube      Panel web para buscar y descargar de YouTube
+      --probar       Prueba cuáles servidores funcionan en tu red
+      --actualizar   Actualiza yt-dlp (para YouTube)
+      --instalar     Instala el comando 'barbashare' en tu sistema
+      --desinstalar  Lo quita
+  -a, --acerca       Créditos
+  -v, --version      Versión
+  -h, --help         Esta ayuda
+
+Sin argumentos abre el menú principal.
+Si pasas una carpeta, se comparte entera (lista navegable o .zip).
+Si hay audio, video o imágenes, el enlace abre un reproductor web:
+portada, letras sincronizadas (.lrc), subtítulos, velocidad, búsqueda.
+Solo se publica lo que elijas, nunca todo tu HOME.
+EOF
+}
+
+acerca() {
+    banner
+    echo
+    printf ' %sBarbaShare%s v%s\n' "$C_W" "$C_0" "$VERSION"
+    printf ' Herramienta creada por %s%s%s\n\n' "$C_C" "$AUTOR" "$C_0"
+    echo " ✔ Comparte archivos y carpetas"
+    echo " ✔ Reproductor web con portada y letras"
+    echo " ✔ Recibe archivos de otras personas"
+    echo " ✔ Contraseña, tiempo y límite de aperturas"
+    echo " ✔ 6 túneles + modo Wi-Fi local"
+    echo " ✔ Prueba de servidores (--probar)"
+    echo " ✔ Panel de YouTube: buscar y descargar"
+    echo " ✔ Hecho para Termux, también en Linux"
+    echo
+    dim " Gracias por usarla 🙌"
+    bar
+    read -rp " ENTER para volver..." _
+}
+
+menu_opciones() {
+    local r v
+    while true; do
+        titulo "⚙ OPCIONES"
+        opcion 1 "🔑 Contraseña: ${PASSWORD:-ninguna}"
+        opcion 2 "⏳ Cierre automático: $( (( EXPIRA_MIN > 0 )) && echo "$EXPIRA_MIN min" || echo "no")"
+        opcion 3 "🎯 Límite de aperturas: $( (( MAX_ACCESOS > 0 )) && echo "$MAX_ACCESOS" || echo "sin límite")"
+        opcion 0 "Volver"
+        echo
+        read -rp " ➜ " r || exit 0
+        case "$r" in
+            1)
+                dim " Escribe la contraseña, 'a' = generar una, Enter = quitar"
+                read -rp " ➜ " v || exit 0
+                if [[ "${v,,}" == "a" ]]; then PASSWORD="$(aleatoria)"; else PASSWORD="$v"; fi
+                ;;
+            2)
+                read -rp " Minutos (0 = sin límite): " v || exit 0
+                [[ "$v" =~ ^[0-9]+$ ]] && EXPIRA_MIN=$((10#$v)) || warn "Número no válido"
+                ;;
+            3)
+                read -rp " Aperturas (0 = sin límite): " v || exit 0
+                [[ "$v" =~ ^[0-9]+$ ]] && MAX_ACCESOS=$((10#$v)) || warn "Número no válido"
+                ;;
+            0|"") return 0 ;;
+            *) warn "Opción no válida"; sleep 1 ;;
+        esac
+    done
+}
+
+flujo_recibir() {
+    local def r="$1"
+    if [[ -n "$r" ]]; then
+        def="$r"
+    else
+        if $IS_TERMUX; then
+            [[ -d "$HOME/storage/shared" ]] || permiso_almacenamiento
+            if [[ -d "$HOME/storage/downloads" ]]; then def="$HOME/storage/downloads/Recibidos"; else def="$HOME/Recibidos"; fi
+        else
+            def="$HOME/Recibidos"
+        fi
+        titulo "📥 RECIBIR ARCHIVOS"
+        dim " Los archivos que te envíen se guardan en:"
+        printf ' %s\n\n' "$(short "$def")"
+        dim " Enter = aceptar · o escribe otra ruta"
+        read -rp " ➜ " r || exit 0
+        [[ -n "$r" ]] && def="${r/#\~/$HOME}"
+    fi
+    mkdir -p -- "$def" 2>/dev/null || { err "No pude crear $def"; return 1; }
+    DEST_RECV="$(readlink -f -- "$def")"
+    if [[ -z "$PASSWORD" && "${MENU_MODE:-false}" == "true" ]]; then
+        warn "Sin contraseña, cualquiera con el enlace puede enviarte archivos."
+        dim " (Puedes poner una en Opciones)"
+        sleep 2
+    fi
+    $METODO_FIJO || elegir_metodo
+    compartir recv
+}
+
+menu_principal() {
+    local r
+    MENU_MODE=true
+    while true; do
+        banner
+        opcion 1 "📤 Compartir archivos o carpetas"
+        opcion 2 "📥 Recibir archivos"
+        opcion 3 "⚙  Opciones (clave, tiempo, límite)"
+        opcion 4 "ℹ  Acerca de"
+        opcion 5 "🎬 YouTube: buscar y descargar"
+        opcion 6 "🧪 Probar servidores"
+        opcion 0 "Salir"
+        echo
+        if [[ -n "$PASSWORD" || $EXPIRA_MIN -gt 0 || $MAX_ACCESOS -gt 0 ]]; then
+            dim " Opciones activas: ${PASSWORD:+clave }$( (( EXPIRA_MIN > 0 )) && echo "${EXPIRA_MIN}min ")$( (( MAX_ACCESOS > 0 )) && echo "máx:$MAX_ACCESOS")"
+        fi
+        read -rp " ➜ " r || break
+        case "$r" in
+            1)
+                if navegar ""; then
+                    $METODO_FIJO || elegir_metodo
+                    compartir
+                    echo
+                    read -rp " ENTER para volver al menú..." _
+                fi
+                ;;
+            2) flujo_recibir ""; echo; read -rp " ENTER para volver al menú..." _ ;;
+            3) menu_opciones ;;
+            4) acerca ;;
+            5) flujo_tube; echo; read -rp " ENTER para volver al menú..." _ ;;
+            6) probar_servidores; echo; read -rp " ENTER para volver al menú..." _ ;;
+            0|q|Q) break ;;
+            *) warn "Opción no válida"; sleep 1 ;;
+        esac
+    done
+}
+
+main() {
+    local args=() files_arg=() a v
+
+    while (( $# )); do
+        case "$1" in
+            -h|--help)    uso; exit 0 ;;
+            -v|--version) echo "BarbaShare v$VERSION · por $AUTOR"; exit 0 ;;
+            -a|--acerca)  acerca; exit 0 ;;
+            --instalar)    instalar_comando; exit $? ;;
+            --desinstalar) desinstalar_comando; exit 0 ;;
+            -z|--zip)     ZIP_FIXED=true; shift ;;
+            -n|--sin-reproductor) PLAYER_OFF=true; shift ;;
+            -r|--recibir) RECV=true; shift ;;
+            --youtube)    TUBE=true; shift ;;
+            --probar)     PROBAR=true; shift ;;
+            --actualizar) ACTUALIZAR=true; shift ;;
+            -p|--clave)
+                if (( $# >= 2 )) && [[ "$2" != -* ]]; then
+                    PASSWORD="$2"; shift 2
+                else
+                    PASSWORD="auto"; shift
+                fi
+                ;;
+            -t|--tiempo)
+                [[ "${2:-}" =~ ^[0-9]+$ ]] || { err "Falta el número de minutos tras $1"; exit 1; }
+                EXPIRA_MIN=$((10#$2)); shift 2
+                ;;
+            -x|--max)
+                [[ "${2:-}" =~ ^[0-9]+$ ]] || { err "Falta el número tras $1"; exit 1; }
+                MAX_ACCESOS=$((10#$2)); shift 2
+                ;;
+            -m|--metodo)
+                if (( $# < 2 )); then err "Falta el método tras $1"; exit 1; fi
+                case "${2,,}" in
+                    auto)                       METODO="auto" ;;
+                    cloudflared|cloudflare|cf)  METODO="cloudflared" ;;
+                    pinggy)                     METODO="pinggy" ;;
+                    lhr|localhost.run)          METODO="lhr" ;;
+                    serveo)                     METODO="serveo" ;;
+                    tuns|tuns.sh)               METODO="tuns" ;;
+                    lt|localtunnel)             METODO="lt" ;;
+                    local|lan|wifi)             METODO="local" ;;
+                    self|este|localhost)        METODO="self" ;;
+                    *) err "Método no válido: $2"; uso; exit 1 ;;
+                esac
+                METODO_FIJO=true
+                shift 2
+                ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+
+    [[ "$PASSWORD" == "auto" ]] && PASSWORD="$(aleatoria)"
+
+    preparar_entorno || exit 1
+
+    if $ACTUALIZAR; then actualizar_ytdlp; exit 0; fi
+    if $PROBAR; then probar_servidores; exit 0; fi
+    if $TUBE; then flujo_tube; exit 0; fi
+    if $RECV; then
+        flujo_recibir "${args[0]:-}"
+        exit 0
+    fi
+
+    for a in "${args[@]}"; do
+        if [[ -e "$a" ]]; then
+            files_arg+=("$(readlink -f -- "$a")")
+        else
+            err "No existe: $a"; exit 1
+        fi
+    done
+
+    if (( ${#files_arg[@]} )); then
+        SEL=("${files_arg[@]}")
+        $METODO_FIJO || elegir_metodo
+        compartir
+        exit 0
+    fi
+
+    menu_principal
+    echo
+    ok "Hasta pronto 👋  · BarbaShare by $AUTOR"
+}
+
+main "$@"
